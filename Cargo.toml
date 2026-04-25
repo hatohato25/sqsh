@@ -1,0 +1,70 @@
+[package]
+name = "sqsh"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75.0"
+authors = ["sqsh contributors"]
+description = "A TUI MySQL client for fast database exploration with fuzzy search"
+license = "MIT"
+repository = "https://github.com/hatohato25/sqsh"
+keywords = ["mysql", "tui", "database", "bastion", "cli"]
+categories = ["command-line-utilities", "database"]
+
+[dependencies]
+# TUI
+ratatui = "0.29"
+crossterm = "0.28"
+
+# Database
+sqlx = { version = "0.7", features = ["runtime-tokio", "tls-rustls", "mysql"] }
+tokio = { version = "1", features = ["full"] }
+futures = "0.3"
+
+# fzf integration
+skim = "0.10"
+
+# Configuration
+toml = "0.8"
+serde = { version = "1", features = ["derive"] }
+
+# Error handling
+thiserror = "2"
+anyhow = "1"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Security (credential memory protection)
+zeroize = { version = "1", features = ["derive"] }
+
+# Unicode display width
+unicode-width = "0.2"
+
+# Clipboard access (Ctrl+V paste support)
+arboard = "3"
+
+# Path expansion
+shellexpand = "3"
+
+# SSH tunneling (bastion support)
+ssh2 = "0.9"
+
+[dev-dependencies]
+mockall = "0.13"
+tempfile = "3.10"
+testcontainers = "0.15"
+testcontainers-modules = { version = "0.3", features = ["mysql"] }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+
+[profile.dev]
+opt-level = 0
+debug = true

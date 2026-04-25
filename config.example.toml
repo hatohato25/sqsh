@@ -1,0 +1,86 @@
+# sqsh configuration file example
+# Place this file at: ~/.config/sqsh/config.toml
+# For security, restrict permissions: chmod 600 ~/.config/sqsh/config.toml
+
+# ---------------------------------------------------------------------------
+# Application settings (optional)
+# ---------------------------------------------------------------------------
+[settings]
+# language = "ja"  # Display language: "en" (default) or "ja"
+
+# ---------------------------------------------------------------------------
+# Direct connection (no bastion required)
+# ---------------------------------------------------------------------------
+[[connections]]
+name = "local-dev"
+# No [connections.bastion] section needed for direct connections.
+# If you have a [default_bastion] configured globally, set `bastion = false`
+# to explicitly skip it and connect directly:
+# bastion = false
+
+[connections.mysql]
+host = "127.0.0.1"
+port = 13306
+database = "testdb"
+user = "testuser"
+password = "testpass"
+timeout = 30
+# ssl_mode: "required" (default, recommended), "preferred", or "disabled"
+ssl_mode = "disabled"  # disabled is acceptable for local development
+
+# Connection pool settings (optional — defaults shown below)
+[connections.mysql.pool]
+max_connections = 5   # Maximum number of connections (default: 10)
+idle_timeout = 300    # Idle connection timeout in seconds (default: 300)
+
+# ---------------------------------------------------------------------------
+# Bastion (SSH jump host) connection example
+# ---------------------------------------------------------------------------
+[[connections]]
+name = "production"
+readonly = true  # Mark connection as read-only (prevents accidental writes)
+
+[connections.bastion]
+host = "bastion.example.com"  # Bastion server hostname or IP
+port = 22
+user = "your_ssh_user"
+key_path = "~/.ssh/id_rsa"    # Path to your SSH private key
+# Omit key_path to use your SSH agent (e.g., 1Password SSH agent)
+
+[connections.mysql]
+host = "mysql.internal.example.com"  # MySQL host reachable from the bastion
+port = 3306
+database = "your_database"
+user = "your_db_user"
+password = "your_password"
+timeout = 60
+ssl_mode = "required"  # Always use "required" in production
+
+# Increase pool size for production workloads
+[connections.mysql.pool]
+max_connections = 20
+idle_timeout = 600
+
+# ---------------------------------------------------------------------------
+# Another connection example (e.g., staging)
+# ---------------------------------------------------------------------------
+[[connections]]
+name = "staging"
+
+[connections.bastion]
+host = "10.0.0.1"   # Bastion server IP address
+port = 22
+user = "your_ssh_user"
+key_path = "~/.ssh/id_rsa"
+
+[connections.mysql]
+host = "mysql.internal.example.com"
+port = 3306
+database = "your_database"
+user = "your_db_user"
+password = "your_password"
+timeout = 45
+ssl_mode = "preferred"  # "preferred" is acceptable for non-production environments
+
+# Omitting [connections.mysql.pool] uses default values:
+#   max_connections = 10, idle_timeout = 300
