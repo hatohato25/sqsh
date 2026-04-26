@@ -5,6 +5,9 @@ on:
     tags:
       - 'v*'
 
+permissions:
+  contents: write
+
 jobs:
   build:
     name: Build ${{ matrix.target }}
@@ -28,15 +31,16 @@ jobs:
         run: cargo build --release --target ${{ matrix.target }}
 
       - name: Create tarball
+        id: tarball
         run: |
           TARBALL="sqsh-${{ github.ref_name }}-${{ matrix.target }}.tar.gz"
           tar -czf "$TARBALL" -C target/${{ matrix.target }}/release sqsh
           shasum -a 256 "$TARBALL" > "$TARBALL.sha256"
-          echo "TARBALL=$TARBALL" >> $GITHUB_ENV
+          echo "name=$TARBALL" >> $GITHUB_OUTPUT
 
       - name: Upload to GitHub Releases
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            ${{ env.TARBALL }}
-            ${{ env.TARBALL }}.sha256
+            ${{ steps.tarball.outputs.name }}
+            ${{ steps.tarball.outputs.name }}.sha256
