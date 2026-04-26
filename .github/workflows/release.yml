@@ -38,6 +38,7 @@ jobs:
           tar -czf "$TARBALL" -C target/${{ matrix.target }}/release sqsh
           shasum -a 256 "$TARBALL" > "$TARBALL.sha256"
           echo "name=$TARBALL" >> $GITHUB_OUTPUT
+          echo "sha256=$(shasum -a 256 $TARBALL | cut -d' ' -f1)" >> $GITHUB_OUTPUT
 
       - name: Upload to GitHub Releases
         uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v3.0.0
@@ -46,3 +47,47 @@ jobs:
           files: |
             ${{ steps.tarball.outputs.name }}
             ${{ steps.tarball.outputs.name }}.sha256
+
+    outputs:
+      sha256: ${{ steps.tarball.outputs.sha256 }}
+      target: ${{ matrix.target }}
+
+  update-formula:
+    name: Update Homebrew Formula
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout homebrew-sqsh
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: hatohato25/homebrew-sqsh
+          token: ${{ secrets.HOMEBREW_GITHUB_TOKEN }}
+
+      - name: Download sha256 files from release
+        run: |
+          VERSION="${{ github.ref_name }}"
+          BASE_URL="https://github.com/hatohato25/sqsh/releases/download/${VERSION}"
+
+          AARCH64_SHA256=$(curl -fsSL "${BASE_URL}/sqsh-${VERSION}-aarch64-apple-darwin.tar.gz.sha256" | cut -d' ' -f1)
+          X86_64_SHA256=$(curl -fsSL "${BASE_URL}/sqsh-${VERSION}-x86_64-apple-darwin.tar.gz.sha256" | cut -d' ' -f1)
+
+          echo "AARCH64_SHA256=$AARCH64_SHA256" >> $GITHUB_ENV
+          echo "X86_64_SHA256=$X86_64_SHA256" >> $GITHUB_ENV
+          echo "VERSION=${VERSION#v}" >> $GITHUB_ENV
+
+      - name: Update Formula
+        run: |
+          sed -i "s/version \".*\"/version \"${VERSION}\"/" Formula/sqsh.rb
+          # aarch64 sha256 を更新（on_arm ブロック内の sha256）
+          awk '/on_arm/,/end/' Formula/sqsh.rb | grep -q sha256 && \
+            perl -i -0pe "s|(on_arm do.*?sha256 \")[a-f0-9]+(\")|\\1${AARCH64_SHA256}\\2|s" Formula/sqsh.rb
+          # x86_64 sha256 を更新（on_intel ブロック内の sha256）
+          perl -i -0pe "s|(on_intel do.*?sha256 \")[a-f0-9]+(\")|\\1${X86_64_SHA256}\\2|s" Formula/sqsh.rb
+
+      - name: Commit and push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/sqsh.rb
+          git commit -m "Update sqsh to v${VERSION}"
+          git push
