@@ -2,6 +2,8 @@
 
 A TUI MySQL client for fast database exploration with fuzzy search, written in Rust.
 
+![demo](https://github.com/hatohato25/sqsh/releases/download/v0.1.0/t-rec.gif)
+
 ## Features
 
 - **Bastion Support**: Connect to MySQL through SSH bastion servers with per-connection or shared bastion configuration
