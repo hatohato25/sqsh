@@ -9,7 +9,7 @@ use sqsh::i18n::{self, Lang};
 use sqsh::tui;
 
 #[derive(Parser, Debug)]
-#[command(name = "sqsh")]
+#[command(name = "sqsh", version)]
 #[command(about = "A TUI MySQL client with bastion (jump host) support", long_about = None)]
 struct Args {
     /// Path to configuration file

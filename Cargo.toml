@@ -7,6 +7,7 @@ authors = ["sqsh contributors"]
 description = "A TUI MySQL client for fast database exploration with fuzzy search"
 license = "MIT"
 repository = "https://github.com/hatohato25/sqsh"
+homepage = "https://github.com/hatohato25/sqsh"
 keywords = ["mysql", "tui", "database", "bastion", "cli"]
 categories = ["command-line-utilities", "database"]
 
@@ -51,7 +52,7 @@ arboard = "3"
 shellexpand = "3"
 
 # SSH tunneling (bastion support)
-ssh2 = "0.9"
+ssh2 = { version = "0.9", features = ["vendored-openssl"] }
 
 [dev-dependencies]
 mockall = "0.13"
