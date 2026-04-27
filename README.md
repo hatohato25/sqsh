@@ -14,6 +14,10 @@ A TUI MySQL client for fast database exploration with fuzzy search, written in R
 - **Read-only Mode**: Prevent accidental writes on sensitive connections
 - **Secure**: Memory-zeroed password handling, TLS/SSL support, config file permission checks
 
+## Website
+
+https://hatohato25.github.io/sqsh/
+
 ## Installation
 
 ### Homebrew
