@@ -23,7 +23,10 @@ impl std::str::FromStr for Lang {
         match s {
             "en" => Ok(Lang::En),
             "ja" => Ok(Lang::Ja),
-            other => Err(format!("Unsupported language: '{}'. Supported: en, ja", other)),
+            other => Err(format!(
+                "Unsupported language: '{}'. Supported: en, ja",
+                other
+            )),
         }
     }
 }
@@ -55,6 +58,11 @@ macro_rules! t {
     ($msg:expr) => {
         $msg.translate($crate::i18n::get_lang())
     };
+}
+
+/// 翻訳可能なメッセージのトレイト
+pub trait Translate {
+    fn translate(&self, lang: Lang) -> String;
 }
 
 // ============================================================
@@ -189,7 +197,10 @@ impl<'a> ErrorMsg<'a> {
             ErrorMsg::Config { detail } => format!("Config error: {}", detail),
             ErrorMsg::ConfigLoad { detail } => format!("Failed to load config: {}", detail),
             ErrorMsg::ConfigPermission { path } => {
-                format!("Invalid config file permission (recommended: 600): {}", path)
+                format!(
+                    "Invalid config file permission (recommended: 600): {}",
+                    path
+                )
             }
             ErrorMsg::Connection { detail } => format!("Connection error: {}", detail),
             ErrorMsg::DatabaseConnection { detail } => {
@@ -253,19 +264,16 @@ pub enum TuiMsg<'a> {
     SqlInputTitle,
     SqlInputReadonlyLabel,
     SqlInputTitleSuffix,
-    SqlInputHint,
     // 接続情報
     ConnectionInfo,
     ConnectionTarget,
+    BastionHost,
     Host,
     Database,
     SelectedDatabase,
     // ヘルプ
     ConnectedHelp,
     QueryHelp,
-    // 接続中
-    ConnectingTitle,
-    ConnectingMessage { connection_name: &'a str },
     // クエリ実行中
     ExecutingQueryTitle,
     StatusTitle,
@@ -284,6 +292,8 @@ pub enum TuiMsg<'a> {
     // カラム選択関連
     ColumnSelectPrompt { table: &'a str },
     NoColumnsFound { table: &'a str },
+    // Shell入力エリア
+    ShellInputTitleFocused,
     // 動的メッセージ（引数付き）
     QueryFailed { detail: &'a str },
     QueryCancelled { query: &'a str },
@@ -295,37 +305,36 @@ impl<'a> TuiMsg<'a> {
     /// 英語メッセージを返す
     pub fn en(&self) -> String {
         match self {
-            TuiMsg::SelectingTitle => "Select Connection".to_string(),
+            TuiMsg::SelectingTitle => {
+                "Select Connection (j/k: move, g/G: top/bottom, Enter: select, q: quit)"
+                    .to_string()
+            }
             TuiMsg::SelectingHelp => {
-                "Enter: select | q: quit".to_string()
+                "j/k: move | g: top | G: bottom | Enter: select | q: quit".to_string()
             }
             TuiMsg::SqlInputTitle => "SQL Input".to_string(),
             TuiMsg::SqlInputReadonlyLabel => "[READONLY]".to_string(),
             TuiMsg::SqlInputTitleSuffix => {
                 "(Enter: run, Ctrl+D: databases, Ctrl+T: tables)".to_string()
             }
-            TuiMsg::SqlInputHint => "Enter SQL and press Enter to execute.".to_string(),
             TuiMsg::ConnectionInfo => "Connection Info".to_string(),
             TuiMsg::ConnectionTarget => "Target".to_string(),
+            TuiMsg::BastionHost => "Bastion".to_string(),
             TuiMsg::Host => "Host".to_string(),
             TuiMsg::Database => "Database".to_string(),
             TuiMsg::SelectedDatabase => "Selected Database".to_string(),
             TuiMsg::ConnectedHelp => {
-                "Enter: run | Ctrl+D: SHOW DATABASES | Ctrl+T: SHOW TABLES | Ctrl+S: select columns | q: quit | sd/st/sc: alias"
+                "Tab: switch focus | Enter: run | Ctrl+D: SHOW DATABASES | Ctrl+T: SHOW TABLES | Ctrl+S: select columns | q: quit | sd/st/sc: alias"
                     .to_string()
             }
             TuiMsg::QueryHelp => "Enter: run query | q: quit".to_string(),
-            TuiMsg::ConnectingTitle => "Connecting".to_string(),
-            TuiMsg::ConnectingMessage { connection_name } => {
-                format!("Connecting to '{}'...", connection_name)
-            }
             TuiMsg::ExecutingQueryTitle => "Executing Query".to_string(),
             TuiMsg::StatusTitle => "Status".to_string(),
             TuiMsg::ExecutingMessage => "Executing query...".to_string(),
             TuiMsg::ColumnSelecting => "Selecting columns...".to_string(),
             TuiMsg::SelectedRecordTitle => "Selected Record".to_string(),
             TuiMsg::ErrorTitle => "Error".to_string(),
-            TuiMsg::ErrorHelp => "Enter/ESC/q: close".to_string(),
+            TuiMsg::ErrorHelp => "Enter/ESC/q: go back".to_string(),
             TuiMsg::QueryResultPrompt => "Result > ".to_string(),
             TuiMsg::SkimInitError => "skim initialization error".to_string(),
             TuiMsg::QueryFailed { detail } => {
@@ -350,41 +359,42 @@ impl<'a> TuiMsg<'a> {
             TuiMsg::ReadonlyBlocked => {
                 "Write operations are not allowed in readonly mode.".to_string()
             }
+            TuiMsg::ShellInputTitleFocused => "Shell Input (Enter: run)".to_string(),
         }
     }
 
     /// 日本語メッセージを返す
     pub fn ja(&self) -> String {
         match self {
-            TuiMsg::SelectingTitle => "接続先選択".to_string(),
-            TuiMsg::SelectingHelp => "Enter: 選択 | q: 終了".to_string(),
+            TuiMsg::SelectingTitle => {
+                "接続先選択 (j/k: 移動, g/G: 先頭/末尾, Enter: 選択, q: 終了)".to_string()
+            }
+            TuiMsg::SelectingHelp => {
+                "j/k: 移動 | g: 先頭 | G: 末尾 | Enter: 選択 | q: 終了".to_string()
+            }
             TuiMsg::SqlInputTitle => "SQL入力".to_string(),
             TuiMsg::SqlInputReadonlyLabel => "[READONLY]".to_string(),
             TuiMsg::SqlInputTitleSuffix => {
                 "(Enter: 実行, Ctrl+D: DB一覧, Ctrl+T: テーブル一覧)".to_string()
             }
-            TuiMsg::SqlInputHint => "SQLを入力してEnterで実行してください。".to_string(),
             TuiMsg::ConnectionInfo => "接続情報".to_string(),
             TuiMsg::ConnectionTarget => "接続先".to_string(),
+            TuiMsg::BastionHost => "踏み台".to_string(),
             TuiMsg::Host => "ホスト".to_string(),
             TuiMsg::Database => "データベース".to_string(),
             TuiMsg::SelectedDatabase => "選択データベース".to_string(),
             TuiMsg::ConnectedHelp => {
-                "Enter: 実行 | Ctrl+D: SHOW DATABASES | Ctrl+T: SHOW TABLES | Ctrl+S: カラム選択 | q: 終了 | sd/st/sc: エイリアス"
+                "Tab: フォーカス切替 | Enter: 実行 | Ctrl+D: SHOW DATABASES | Ctrl+T: SHOW TABLES | Ctrl+S: カラム選択 | q: 終了 | sd/st/sc: エイリアス"
                     .to_string()
             }
             TuiMsg::QueryHelp => "Enter: クエリ実行 | q: 終了".to_string(),
-            TuiMsg::ConnectingTitle => "接続中".to_string(),
-            TuiMsg::ConnectingMessage { connection_name } => {
-                format!("'{}' に接続しています...", connection_name)
-            }
             TuiMsg::ExecutingQueryTitle => "実行中のクエリ".to_string(),
             TuiMsg::StatusTitle => "ステータス".to_string(),
             TuiMsg::ExecutingMessage => "クエリを実行しています...".to_string(),
             TuiMsg::ColumnSelecting => "カラム選択中...".to_string(),
             TuiMsg::SelectedRecordTitle => "選択レコード".to_string(),
             TuiMsg::ErrorTitle => "エラー".to_string(),
-            TuiMsg::ErrorHelp => "Enter/ESC/q: 閉じる".to_string(),
+            TuiMsg::ErrorHelp => "Enter/ESC/q: 前の画面に戻る".to_string(),
             TuiMsg::QueryResultPrompt => "結果 > ".to_string(),
             TuiMsg::SkimInitError => "skim初期化エラー".to_string(),
             TuiMsg::QueryFailed { detail } => {
@@ -406,6 +416,7 @@ impl<'a> TuiMsg<'a> {
             TuiMsg::ReadonlyBlocked => {
                 "readonlyモードのため、書き込み操作は実行できません。".to_string()
             }
+            TuiMsg::ShellInputTitleFocused => "SHELL入力 (Enter: 実行)".to_string(),
         }
     }
 
@@ -429,7 +440,10 @@ pub enum ConnectionMsg<'a> {
     /// 接続失敗（原因不明）
     ConnectionFailed,
     /// SSH鍵/agentの両認証失敗
-    SshAuthFailed { key_err: &'a str, agent_err: &'a str },
+    SshAuthFailed {
+        key_err: &'a str,
+        agent_err: &'a str,
+    },
     /// SSH agent認証失敗
     SshAgentAuthFailed { detail: &'a str },
     /// SSH認証エラー（一般）
@@ -531,7 +545,9 @@ mod tests {
     // ConfigMsg テスト
     #[test]
     fn test_config_msg_not_found_en() {
-        let msg = ConfigMsg::NotFound { path: "/path/to/config.toml" };
+        let msg = ConfigMsg::NotFound {
+            path: "/path/to/config.toml",
+        };
         let text = msg.translate(Lang::En);
         assert!(text.contains("Config file not found"));
         assert!(text.contains("/path/to/config.toml"));
@@ -539,7 +555,9 @@ mod tests {
 
     #[test]
     fn test_config_msg_not_found_ja() {
-        let msg = ConfigMsg::NotFound { path: "/path/to/config.toml" };
+        let msg = ConfigMsg::NotFound {
+            path: "/path/to/config.toml",
+        };
         let text = msg.translate(Lang::Ja);
         assert!(text.contains("設定ファイルが見つかりません"));
         assert!(text.contains("/path/to/config.toml"));
@@ -547,7 +565,9 @@ mod tests {
 
     #[test]
     fn test_config_msg_parse_failed_en() {
-        let msg = ConfigMsg::ParseFailed { detail: "invalid toml" };
+        let msg = ConfigMsg::ParseFailed {
+            detail: "invalid toml",
+        };
         let text = msg.translate(Lang::En);
         assert!(text.contains("Failed to parse config file"));
         assert!(text.contains("invalid toml"));
@@ -555,7 +575,9 @@ mod tests {
 
     #[test]
     fn test_config_msg_parse_failed_ja() {
-        let msg = ConfigMsg::ParseFailed { detail: "invalid toml" };
+        let msg = ConfigMsg::ParseFailed {
+            detail: "invalid toml",
+        };
         let text = msg.translate(Lang::Ja);
         assert!(text.contains("設定ファイルの解析に失敗しました"));
     }
@@ -606,7 +628,10 @@ mod tests {
 
     #[test]
     fn test_config_msg_permission_warning_en() {
-        let msg = ConfigMsg::PermissionWarning { mode: 0o644, path: "/path/config.toml" };
+        let msg = ConfigMsg::PermissionWarning {
+            mode: 0o644,
+            path: "/path/config.toml",
+        };
         let text = msg.translate(Lang::En);
         assert!(text.contains("644"));
         assert!(text.contains("chmod 600"));
@@ -615,7 +640,10 @@ mod tests {
 
     #[test]
     fn test_config_msg_permission_warning_ja() {
-        let msg = ConfigMsg::PermissionWarning { mode: 0o644, path: "/path/config.toml" };
+        let msg = ConfigMsg::PermissionWarning {
+            mode: 0o644,
+            path: "/path/config.toml",
+        };
         let text = msg.translate(Lang::Ja);
         assert!(text.contains("644"));
         assert!(text.contains("chmod 600"));
@@ -643,7 +671,10 @@ mod tests {
     #[test]
     fn test_error_msg_query_timeout_ja() {
         let msg = ErrorMsg::QueryTimeout;
-        assert_eq!(msg.translate(Lang::Ja), "クエリの実行がタイムアウトしました");
+        assert_eq!(
+            msg.translate(Lang::Ja),
+            "クエリの実行がタイムアウトしました"
+        );
     }
 
     // TuiMsg テスト
@@ -675,7 +706,9 @@ mod tests {
 
     #[test]
     fn test_tui_msg_query_failed_en() {
-        let msg = TuiMsg::QueryFailed { detail: "syntax error" };
+        let msg = TuiMsg::QueryFailed {
+            detail: "syntax error",
+        };
         let text = msg.translate(Lang::En);
         assert!(text.contains("Query execution failed"));
         assert!(text.contains("syntax error"));
@@ -683,7 +716,9 @@ mod tests {
 
     #[test]
     fn test_tui_msg_query_failed_ja() {
-        let msg = TuiMsg::QueryFailed { detail: "syntax error" };
+        let msg = TuiMsg::QueryFailed {
+            detail: "syntax error",
+        };
         let text = msg.translate(Lang::Ja);
         assert!(text.contains("クエリ実行に失敗しました"));
         assert!(text.contains("syntax error"));
@@ -706,7 +741,9 @@ mod tests {
     // ConnectionMsg テスト
     #[test]
     fn test_connection_msg_readonly_set_failed_en() {
-        let msg = ConnectionMsg::ReadonlySetFailed { detail: "permission denied" };
+        let msg = ConnectionMsg::ReadonlySetFailed {
+            detail: "permission denied",
+        };
         let text = msg.translate(Lang::En);
         assert!(text.contains("Failed to set readonly mode"));
         assert!(text.contains("permission denied"));
@@ -714,7 +751,9 @@ mod tests {
 
     #[test]
     fn test_connection_msg_readonly_set_failed_ja() {
-        let msg = ConnectionMsg::ReadonlySetFailed { detail: "permission denied" };
+        let msg = ConnectionMsg::ReadonlySetFailed {
+            detail: "permission denied",
+        };
         let text = msg.translate(Lang::Ja);
         assert!(text.contains("readonlyモード設定に失敗"));
     }

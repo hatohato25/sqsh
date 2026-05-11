@@ -10,7 +10,7 @@ use crate::config::BastionSetting;
 use crate::i18n::TuiMsg;
 use crate::t;
 
-use super::{App, AppState, CompletionState};
+use super::{App, AppState, CompletionState, InputFocus};
 use crate::completion::CompletionKind;
 
 impl App {
@@ -22,6 +22,9 @@ impl App {
         let conn_name = self.connection_name.as_ref()?.clone();
 
         let separator_style = Style::default().fg(Color::DarkGray);
+        let bastion_style = Style::default()
+            .fg(Color::Magenta)
+            .add_modifier(Modifier::BOLD);
         let name_style = Style::default()
             .fg(Color::Cyan)
             .add_modifier(Modifier::BOLD);
@@ -32,7 +35,15 @@ impl App {
             .fg(Color::Yellow)
             .add_modifier(Modifier::BOLD);
 
-        let mut spans = vec![Span::styled(conn_name, name_style)];
+        let mut spans = Vec::new();
+
+        // bastion経由の場合はbastionホスト名を先頭に表示して接続経路を明示する
+        if let Some(ref bastion) = self.bastion_name {
+            spans.push(Span::styled(bastion.clone(), bastion_style));
+            spans.push(Span::styled(" > ", separator_style));
+        }
+
+        spans.push(Span::styled(conn_name, name_style));
 
         if let Some(ref db) = self.current_database {
             spans.push(Span::styled(" > ", separator_style));
@@ -59,9 +70,6 @@ impl App {
                 connections,
                 selected_index,
             } => self.render_selecting(frame, size, connections, *selected_index),
-            AppState::Connecting { connection_name, spinner_frame, .. } => {
-                self.render_connecting(frame, size, connection_name, *spinner_frame)
-            }
             AppState::Connected { .. } => self.render_connected(frame, size),
             AppState::Executing { query } => self.render_executing(frame, size, query),
             // ストリーミング待ち中はExecutingと同じ表示
@@ -134,67 +142,24 @@ impl App {
         frame.render_widget(help, chunks[1]);
     }
 
-    /// 接続中画面（スピナー表示）
-    pub(super) fn render_connecting(
-        &self,
-        frame: &mut Frame,
-        area: Rect,
-        connection_name: &str,
-        spinner_frame: u8,
-    ) {
-        const SPINNER_FRAMES: [&str; 4] = ["|", "/", "-", "\\"];
-        let spinner = SPINNER_FRAMES[(spinner_frame as usize) % SPINNER_FRAMES.len()];
-
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Min(3), Constraint::Length(3)])
-            .split(area);
-
-        let message = format!(
-            " {} {}",
-            spinner,
-            t!(TuiMsg::ConnectingMessage { connection_name })
-        );
-        let paragraph = Paragraph::new(message)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(t!(TuiMsg::ConnectingTitle)),
-            )
-            .style(Style::default().fg(Color::Cyan));
-
-        frame.render_widget(paragraph, chunks[0]);
-
-        let help = Paragraph::new("Ctrl+C: quit")
-            .style(Style::default().fg(Color::Gray));
-        frame.render_widget(help, chunks[1]);
-    }
-
     /// 接続済み画面（SQL入力）
     pub(super) fn render_connected(&self, frame: &mut Frame, area: Rect) {
-        let has_record = self.selected_record.is_some();
-
-        let chunks = if has_record {
-            Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([
-                    Constraint::Length(2),  // パンくずリスト
-                    Constraint::Length(5),  // SQL入力エリア
-                    Constraint::Min(5),     // 選択レコードプレビュー
-                    Constraint::Length(3),  // ヘルプ
-                ])
-                .split(area)
-        } else {
-            Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([
-                    Constraint::Length(2),  // パンくずリスト
-                    Constraint::Length(7),  // SQL入力エリア
-                    Constraint::Min(5),     // 接続情報・説明エリア
-                    Constraint::Length(3),  // ヘルプ
-                ])
-                .split(area)
-        };
+        // Shell入力エリアを SQL入力エリアと接続情報エリアの間に挿入する
+        // chunks[0]: パンくずリスト
+        // chunks[1]: SQL入力エリア
+        // chunks[2]: Shell入力エリア
+        // chunks[3]: 接続情報・選択レコードプレビュー（has_record に応じて内容を切り替え）
+        // chunks[4]: ヘルプ
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(2), // パンくずリスト
+                Constraint::Length(5), // SQL入力エリア
+                Constraint::Length(5), // Shell入力エリア
+                Constraint::Min(3),    // 接続情報・選択レコードプレビュー
+                Constraint::Length(3), // ヘルプ
+            ])
+            .split(area);
 
         // パンくずリストを描画する
         if let Some(breadcrumb) = self.breadcrumb_line() {
@@ -203,27 +168,26 @@ impl App {
         }
 
         // SQL入力エリア（選択範囲がある場合はハイライト表示）
-        let input_line = if let Some(sel_start) = self.selection_start {
-            let start = sel_start.min(self.cursor_position);
-            let end = sel_start.max(self.cursor_position);
+        let input_line = if let Some(sel_start) = self.sql.selection_start {
+            let start = sel_start.min(self.sql.cursor_position);
+            let end = sel_start.max(self.sql.cursor_position);
             let byte_start = self.char_to_byte(start);
             let byte_end = self.char_to_byte(end);
-            let before = &self.query_input[..byte_start];
-            let selected = &self.query_input[byte_start..byte_end];
-            let after = &self.query_input[byte_end..];
+            let before = &self.sql.text[..byte_start];
+            let selected = &self.sql.text[byte_start..byte_end];
+            let after = &self.sql.text[byte_end..];
             Line::from(vec![
                 Span::raw(before),
-                Span::styled(
-                    selected,
-                    Style::default().bg(Color::Blue).fg(Color::White),
-                ),
+                Span::styled(selected, Style::default().bg(Color::Blue).fg(Color::White)),
                 Span::raw(after),
             ])
         } else {
-            Line::from(self.query_input.as_str())
+            Line::from(self.sql.text.as_str())
         };
         let input_text = Text::from(input_line);
         // readonlyモード時はタイトルの [READONLY] 部分を赤色+太字で目立たせる
+        // フォーカス時は Yellow ボーダーで強調する
+        let sql_focused = self.input_focus == InputFocus::Sql;
         let input_title = if self.is_current_readonly() {
             Line::from(vec![
                 Span::raw(format!("{} ", t!(TuiMsg::SqlInputTitle))),
@@ -240,35 +204,83 @@ impl App {
                 t!(TuiMsg::SqlInputTitleSuffix)
             ))
         };
+        let sql_border_style = if sql_focused {
+            Style::default().fg(Color::Yellow)
+        } else {
+            Style::default()
+        };
         let input_paragraph = Paragraph::new(input_text).block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(input_title),
+                .title(input_title)
+                .border_style(sql_border_style),
         );
 
         frame.render_widget(input_paragraph, chunks[1]);
 
-        // カーソルを表示（入力エリア内の適切な位置）
-        // cursor_positionはchar単位なので、表示幅（セル数）に変換してオフセットを計算する
-        let cursor_display_offset: u16 = self
-            .query_input
-            .chars()
-            .take(self.cursor_position)
-            .map(|c| unicode_width::UnicodeWidthChar::width(c).unwrap_or(1) as u16)
-            .sum();
-        let cursor_x = chunks[1].x + 1 + cursor_display_offset;
-        let cursor_y = chunks[1].y + 1;
-        frame.set_cursor_position(ratatui::layout::Position { x: cursor_x, y: cursor_y });
+        // Shell入力エリアを描画する
+        let shell_focused = self.input_focus == InputFocus::Shell;
+        // フォーカス状態に関係なく常に操作ヒントを表示する
+        let shell_title = t!(TuiMsg::ShellInputTitleFocused);
+        let shell_border_style = if shell_focused {
+            Style::default().fg(Color::Yellow)
+        } else {
+            Style::default()
+        };
+        let shell_paragraph = Paragraph::new(self.shell.text.as_str()).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(shell_title)
+                .border_style(shell_border_style),
+        );
+        frame.render_widget(shell_paragraph, chunks[2]);
 
-        // 接続情報 or 選択レコードプレビュー
+        // カーソルを表示（フォーカスに応じて SQL または Shell 入力エリアに描画）
+        let cursor_display_offset: u16;
+        match self.input_focus {
+            InputFocus::Sql => {
+                // SQL入力エリアのカーソル（cursor_positionはchar単位→表示幅に変換）
+                cursor_display_offset = self
+                    .sql
+                    .text
+                    .chars()
+                    .take(self.sql.cursor_position)
+                    .map(|c| unicode_width::UnicodeWidthChar::width(c).unwrap_or(1) as u16)
+                    .sum();
+                let cursor_x = chunks[1].x + 1 + cursor_display_offset;
+                let cursor_y = chunks[1].y + 1;
+                frame.set_cursor_position(ratatui::layout::Position {
+                    x: cursor_x,
+                    y: cursor_y,
+                });
+            }
+            InputFocus::Shell => {
+                // Shell入力エリアのカーソル（shell.cursor_positionはchar単位→表示幅に変換）
+                cursor_display_offset = self
+                    .shell
+                    .text
+                    .chars()
+                    .take(self.shell.cursor_position)
+                    .map(|c| unicode_width::UnicodeWidthChar::width(c).unwrap_or(1) as u16)
+                    .sum();
+                let cursor_x = chunks[2].x + 1 + cursor_display_offset;
+                let cursor_y = chunks[2].y + 1;
+                frame.set_cursor_position(ratatui::layout::Position {
+                    x: cursor_x,
+                    y: cursor_y,
+                });
+            }
+        };
+
+        // 接続情報 or 選択レコードプレビュー（chunks[3] に描画）
         let manager = match &self.state {
             AppState::Connected { manager } => manager,
             _ => {
                 let empty = Paragraph::new("");
-                frame.render_widget(empty, chunks[2]);
-                let help = Paragraph::new(t!(TuiMsg::QueryHelp))
-                    .style(Style::default().fg(Color::Gray));
-                frame.render_widget(help, chunks[3]);
+                frame.render_widget(empty, chunks[3]);
+                let help =
+                    Paragraph::new(t!(TuiMsg::QueryHelp)).style(Style::default().fg(Color::Gray));
+                frame.render_widget(help, chunks[4]);
                 return;
             }
         };
@@ -290,7 +302,7 @@ impl App {
                 )
                 .style(Style::default().fg(Color::White));
 
-            frame.render_widget(preview_paragraph, chunks[2]);
+            frame.render_widget(preview_paragraph, chunks[3]);
         } else {
             // 通常の接続情報表示
             let conn_config = manager.config();
@@ -308,32 +320,57 @@ impl App {
             if let Some(ref db) = self.current_database {
                 info_lines.push_str(&format!("\n{}: {}", t!(TuiMsg::SelectedDatabase), db));
             }
-            info_lines.push_str(&format!("\n\n{}", t!(TuiMsg::SqlInputHint)));
+            // bastion経由接続の場合はbastionホスト情報を表示する
+            if let Some(crate::config::BastionSetting::Config(ref bastion_cfg)) =
+                conn_config.bastion
+            {
+                info_lines.push_str(&format!(
+                    "\n{}: {}@{}:{}",
+                    t!(TuiMsg::BastionHost),
+                    bastion_cfg.user,
+                    bastion_cfg.host,
+                    bastion_cfg.port
+                ));
+            }
 
             let info_paragraph = Paragraph::new(info_lines)
-                .block(Block::default().borders(Borders::ALL).title(t!(TuiMsg::ConnectionInfo)))
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title(t!(TuiMsg::ConnectionInfo)),
+                )
                 .style(Style::default().fg(Color::Cyan));
 
-            frame.render_widget(info_paragraph, chunks[2]);
+            frame.render_widget(info_paragraph, chunks[3]);
         }
 
-        // ヘルプ
+        // ヘルプ（chunks[4] に描画）
         let help_text = t!(TuiMsg::ConnectedHelp);
         let help = Paragraph::new(help_text).style(Style::default().fg(Color::Gray));
 
-        frame.render_widget(help, chunks[3]);
+        frame.render_widget(help, chunks[4]);
 
         // 補完ポップアップを最後（最上層）に描画する
-        // chunks[1] はSQL入力エリア（chunks[0] はパンくずリスト）
-        if let Some(ref comp_state) = self.completion_state {
-            if !comp_state.candidates.is_empty() {
-                let popup_rect = completion_popup_rect(
-                    chunks[1],
-                    cursor_display_offset,
-                    comp_state.candidates.len(),
-                    frame.area(),
-                );
-                render_completion_popup(frame, popup_rect, comp_state);
+        // SQL フォーカス時のみ表示する（Shell フォーカス時は表示しない）
+        if self.input_focus == InputFocus::Sql {
+            if let Some(ref comp_state) = self.sql.completion_state {
+                if !comp_state.candidates.is_empty() {
+                    // SQL フォーカス時は cursor_display_offset が Sql ブランチで計算済みなので再計算する
+                    let sql_cursor_offset: u16 = self
+                        .sql
+                        .text
+                        .chars()
+                        .take(self.sql.cursor_position)
+                        .map(|c| unicode_width::UnicodeWidthChar::width(c).unwrap_or(1) as u16)
+                        .sum();
+                    let popup_rect = completion_popup_rect(
+                        chunks[1],
+                        sql_cursor_offset,
+                        comp_state.candidates.len(),
+                        frame.area(),
+                    );
+                    render_completion_popup(frame, popup_rect, comp_state);
+                }
             }
         }
     }
@@ -343,9 +380,9 @@ impl App {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(2),  // パンくずリスト
-                Constraint::Length(5),  // クエリ表示
-                Constraint::Min(3),     // ステータス
+                Constraint::Length(2), // パンくずリスト
+                Constraint::Length(5), // クエリ表示
+                Constraint::Min(3),    // ステータス
             ])
             .split(area);
 
@@ -367,7 +404,11 @@ impl App {
         // 実行中表示
         let text = Text::from(t!(TuiMsg::ExecutingMessage));
         let paragraph = Paragraph::new(text)
-            .block(Block::default().borders(Borders::ALL).title(t!(TuiMsg::StatusTitle)))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(t!(TuiMsg::StatusTitle)),
+            )
             .style(Style::default().fg(Color::Yellow));
 
         frame.render_widget(paragraph, chunks[2]);
@@ -378,9 +419,9 @@ impl App {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(2),  // パンくずリスト
-                Constraint::Min(5),     // エラーメッセージ
-                Constraint::Length(3),  // ヘルプ
+                Constraint::Length(2), // パンくずリスト
+                Constraint::Min(5),    // エラーメッセージ
+                Constraint::Length(3), // ヘルプ
             ])
             .split(area);
 
@@ -450,7 +491,11 @@ pub(super) fn completion_popup_rect(
 }
 
 /// 補完ポップアップを描画する
-pub(super) fn render_completion_popup(frame: &mut Frame, popup_rect: Rect, state: &CompletionState) {
+pub(super) fn render_completion_popup(
+    frame: &mut Frame,
+    popup_rect: Rect,
+    state: &CompletionState,
+) {
     frame.render_widget(Clear, popup_rect);
 
     let items: Vec<ListItem> = state

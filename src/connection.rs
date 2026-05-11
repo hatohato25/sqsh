@@ -69,39 +69,39 @@ impl ConnectionManager {
         // bastion経由接続の判定
         // resolve_connections()適用後のConfigではbastionはConfig(BastionConfig)かNoneのみ。
         // Toggleは生のConfigではありうるが、connect()はresolve後のConfigを受け取ることを想定する。
-        let (tunnel, mysql_host, mysql_port) = if let Some(BastionSetting::Config(ref bastion_cfg)) = config.bastion {
-            tracing::info!(
-                "Setting up SSH tunnel via bastion: {}@{}:{}",
-                bastion_cfg.user,
-                bastion_cfg.host,
-                bastion_cfg.port
-            );
+        let (tunnel, mysql_host, mysql_port) =
+            if let Some(BastionSetting::Config(ref bastion_cfg)) = config.bastion {
+                tracing::info!(
+                    "Setting up SSH tunnel via bastion: {}@{}:{}",
+                    bastion_cfg.user,
+                    bastion_cfg.host,
+                    bastion_cfg.port
+                );
 
-            // SSH tunnel確立（同期処理をspawn_blockingで実行）
-            let bastion_cfg = bastion_cfg.clone();
-            let mysql_host_for_tunnel = config.mysql.host.clone();
-            let mysql_port = config.mysql.port;
-            let ssh_timeout = Duration::from_secs(config.mysql.timeout);
+                // SSH tunnel確立（同期処理をspawn_blockingで実行）
+                let bastion_cfg = bastion_cfg.clone();
+                let mysql_host_for_tunnel = config.mysql.host.clone();
+                let mysql_port = config.mysql.port;
 
-            let tunnel = tokio::task::spawn_blocking(move || {
-                establish_ssh_tunnel(&bastion_cfg, &mysql_host_for_tunnel, mysql_port, ssh_timeout)
-            })
-            .await
-            .map_err(|e| Error::connection_context("SSH tunnel task", e))??;
+                let tunnel = tokio::task::spawn_blocking(move || {
+                    establish_ssh_tunnel(&bastion_cfg, &mysql_host_for_tunnel, mysql_port)
+                })
+                .await
+                .map_err(|e| Error::connection_context("SSH tunnel task", e))??;
 
-            let local_port = tunnel.local_port;
-            tracing::info!(
-                "SSH tunnel established: localhost:{} -> {}:{}",
-                local_port,
-                config.mysql.host,
-                mysql_port
-            );
+                let local_port = tunnel.local_port;
+                tracing::info!(
+                    "SSH tunnel established: localhost:{} -> {}:{}",
+                    local_port,
+                    config.mysql.host,
+                    mysql_port
+                );
 
-            (Some(tunnel), LOCALHOST.to_string(), local_port)
-        } else {
-            tracing::info!("Direct connection (no bastion)");
-            (None, config.mysql.host.clone(), config.mysql.port)
-        };
+                (Some(tunnel), LOCALHOST.to_string(), local_port)
+            } else {
+                tracing::info!("Direct connection (no bastion)");
+                (None, config.mysql.host.clone(), config.mysql.port)
+            };
 
         // SSL/TLS設定を決定
         let ssl_mode = match config.mysql.ssl_mode {
@@ -131,25 +131,32 @@ impl ConnectionManager {
             pool_config.idle_timeout
         );
 
-        let pool = MySqlPoolOptions::new()
+        let mut pool_options = MySqlPoolOptions::new()
             .max_connections(pool_config.max_connections)
             .idle_timeout(Duration::from_secs(pool_config.idle_timeout))
-            .acquire_timeout(Duration::from_secs(config.mysql.timeout))
+            .acquire_timeout(Duration::from_secs(config.mysql.timeout));
+
+        // readonlyモード: after_connect を使いプール内の全物理コネクションに
+        // SET SESSION transaction_read_only = ON を適用する。
+        // 1コネクションだけに発行していた従来の方式では、プール拡張時に追加された
+        // コネクションへの適用が漏れるため、新規コネクション確立ごとに必ず実行する。
+        if readonly {
+            pool_options = pool_options.after_connect(|conn, _meta| {
+                Box::pin(async move {
+                    sqlx::query("SET SESSION transaction_read_only = ON")
+                        .execute(&mut *conn)
+                        .await?;
+                    Ok(())
+                })
+            });
+        }
+
+        let pool = pool_options
             .connect_with(connect_options)
             .await
             .map_err(Error::database_connection_detail)?;
 
-        // readonlyモード: サーバー側でも書き込みをブロックするため
-        // クライアントブロックだけでなくセッション変数でも制御する
         if readonly {
-            sqlx::query("SET SESSION transaction_read_only = ON")
-                .execute(&pool)
-                .await
-                .map_err(|e| {
-                    Error::Connection(t!(ConnectionMsg::ReadonlySetFailed {
-                        detail: &e.to_string()
-                    }))
-                })?;
             tracing::info!("Connection '{}' is set to readonly mode", config.name);
         }
 
@@ -212,9 +219,7 @@ impl ConnectionManager {
         }
 
         // すべてのリトライが失敗した場合
-        Err(last_error.unwrap_or_else(|| {
-            Error::Connection(t!(ConnectionMsg::ConnectionFailed))
-        }))
+        Err(last_error.unwrap_or_else(|| Error::Connection(t!(ConnectionMsg::ConnectionFailed))))
     }
 
     /// エラーがタイムアウトエラーかどうかを判定
@@ -231,11 +236,6 @@ impl ConnectionManager {
                     }
                     _ => false,
                 }
-            }
-            // SSH接続・DNS解決タイムアウトはError::Connectionとして上がるためリトライ対象外にする
-            Error::Connection(msg) => {
-                let lower = msg.to_lowercase();
-                lower.contains("timeout") || lower.contains("timed out") || lower.contains("タイムアウト")
             }
             _ => false,
         }
@@ -283,7 +283,6 @@ fn establish_ssh_tunnel(
     bastion_cfg: &crate::config::BastionConfig,
     mysql_host: &str,
     mysql_port: u16,
-    timeout: Duration,
 ) -> Result<SshTunnel> {
     // ローカルポートを動的に割り当て（0を指定するとOSが自動割り当て）
     let listener = TcpListener::bind((LOCALHOST, 0))
@@ -296,24 +295,8 @@ fn establish_ssh_tunnel(
 
     tracing::debug!("Allocated local port: {}", local_port);
 
-    // bastion serverへSSH接続（OSデフォルトの長いタイムアウトを避けるため明示的に設定）
-    // DNS解決もタイムアウト対象にするため、別スレッドで実行して timeout 内に完了しなければ失敗させる
-    use std::net::ToSocketAddrs;
-    let host_port = format!("{}:{}", bastion_cfg.host, bastion_cfg.port);
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let result = host_port
-            .to_socket_addrs()
-            .ok()
-            .and_then(|mut it| it.next());
-        let _ = tx.send(result);
-    });
-    let addr = rx
-        .recv_timeout(timeout)
-        .ok()
-        .flatten()
-        .ok_or_else(|| Error::connection_context("bastionアドレスの解決", "タイムアウトまたはアドレスが見つかりません"))?;
-    let tcp_stream = TcpStream::connect_timeout(&addr, timeout)
+    // bastion serverへSSH接続
+    let tcp_stream = TcpStream::connect(format!("{}:{}", bastion_cfg.host, bastion_cfg.port))
         .map_err(|e| Error::connection_context("bastion serverへの接続", e))?;
 
     let mut session =

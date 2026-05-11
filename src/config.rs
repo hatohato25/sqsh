@@ -36,7 +36,7 @@ pub struct Config {
 /// 両方を受け付けるため、untagged enum で deserialize する。
 ///
 /// TOML上の3パターン:
-/// - 省略: default_bastion が適用される（後方互換）
+/// - 省略: 直接接続（bastionを使わない）
 /// - `bastion = false`: bastion を使わない（直接接続）
 /// - `bastion = true`: 明示的に default_bastion を使う（省略と同等）
 /// - `[connections.bastion]` テーブル: 個別のbastion設定を使用
@@ -59,7 +59,7 @@ pub struct ConnectionConfig {
 
     /// bastion（踏み台）サーバー設定
     ///
-    /// None: 省略（default_bastionを適用）
+    /// None: 省略（直接接続）
     /// Some(BastionSetting::Toggle(false)): 直接接続（default_bastionをスキップ）
     /// Some(BastionSetting::Toggle(true)): 明示的にdefault_bastionを使用
     /// Some(BastionSetting::Config(...)): 個別のbastion設定を使用
@@ -278,9 +278,15 @@ impl Config {
                 // PoolConfigPartialのフィールド単位マージにより、一部フィールドだけdefault_mysql_poolから取る設定が可能
                 let mut mysql = conn.mysql.clone();
                 mysql.pool = PoolConfigPartial {
-                    max_connections: conn.mysql.pool.max_connections
+                    max_connections: conn
+                        .mysql
+                        .pool
+                        .max_connections
                         .or_else(|| default_pool.and_then(|d| d.max_connections)),
-                    idle_timeout: conn.mysql.pool.idle_timeout
+                    idle_timeout: conn
+                        .mysql
+                        .pool
+                        .idle_timeout
                         .or_else(|| default_pool.and_then(|d| d.idle_timeout)),
                 };
 
@@ -318,7 +324,9 @@ impl Config {
 /// 文字列が空でないことを検証
 fn validate_not_empty(value: &str, field_name: &str) -> Result<()> {
     if value.is_empty() {
-        return Err(Error::config(t!(ConfigMsg::FieldEmpty { field: field_name })));
+        return Err(Error::config(t!(ConfigMsg::FieldEmpty {
+            field: field_name
+        })));
     }
     Ok(())
 }
@@ -326,7 +334,9 @@ fn validate_not_empty(value: &str, field_name: &str) -> Result<()> {
 /// ポート番号が0でないことを検証
 fn validate_port(port: u16, field_name: &str) -> Result<()> {
     if port == 0 {
-        return Err(Error::config(t!(ConfigMsg::InvalidPort { field: field_name })));
+        return Err(Error::config(t!(ConfigMsg::InvalidPort {
+            field: field_name
+        })));
     }
     Ok(())
 }
@@ -422,8 +432,7 @@ fn default_mysql_port() -> u16 {
 }
 
 fn default_timeout() -> u64 {
-    // デフォルト5秒: 設定誤りによる長時間ブロックを防ぐため短く設定する
-    5
+    30
 }
 
 fn default_ssl_mode() -> SslMode {
@@ -470,7 +479,7 @@ mod tests {
 
     #[test]
     fn test_default_timeout() {
-        assert_eq!(default_timeout(), 5);
+        assert_eq!(default_timeout(), 30);
     }
 
     #[test]
@@ -1016,7 +1025,10 @@ password = "password"
         set_test_file_permissions_600(temp_file.path());
 
         let config = Config::load(temp_file.path().to_str().unwrap()).unwrap();
-        assert!(!config.connections[0].readonly, "readonlyフィールド省略時はfalseになるべき");
+        assert!(
+            !config.connections[0].readonly,
+            "readonlyフィールド省略時はfalseになるべき"
+        );
     }
 
     #[test]
@@ -1042,7 +1054,10 @@ password = "password"
         set_test_file_permissions_600(temp_file.path());
 
         let config = Config::load(temp_file.path().to_str().unwrap()).unwrap();
-        assert!(config.connections[0].readonly, "readonlyフィールドtrueはtrueになるべき");
+        assert!(
+            config.connections[0].readonly,
+            "readonlyフィールドtrueはtrueになるべき"
+        );
     }
 
     #[test]
@@ -1077,8 +1092,14 @@ password = "testpass"
         let resolved = config.resolve_connections();
 
         // bastion = true + default_bastion 適用後もreadonlyが維持される
-        assert!(resolved[0].readonly, "resolve_connections後もreadonly=trueが維持されるべき");
-        assert!(resolved[0].bastion.is_some(), "bastion=trueでデフォルトbastionが適用されるべき");
+        assert!(
+            resolved[0].readonly,
+            "resolve_connections後もreadonly=trueが維持されるべき"
+        );
+        assert!(
+            resolved[0].bastion.is_some(),
+            "bastion=trueでデフォルトbastionが適用されるべき"
+        );
     }
 
     #[test]
@@ -1118,7 +1139,10 @@ password = "password"
 
         // get_bastion()でNoneが返ること（直接接続）
         let bastion = config.connections[0].get_bastion(&config.default_bastion);
-        assert!(bastion.is_none(), "bastion = false のとき direct 接続になるべき");
+        assert!(
+            bastion.is_none(),
+            "bastion = false のとき direct 接続になるべき"
+        );
 
         // resolve_connections()でもbastionはNoneになること
         let resolved = config.resolve_connections();

@@ -9,10 +9,9 @@ use crate::query::QueryResult;
 use crate::t;
 
 use super::{
-    App, AppState, ResultRowItem, SimpleSkimItem, SkimAction,
-    append_preview_to_chunk, build_preview_cmd, build_result_skim_options,
-    calculate_column_widths, cleanup_preview_dir, determine_skim_action,
-    flush_preview_chunk, format_row_display, preview_dir,
+    append_preview_to_chunk, build_preview_cmd, build_result_skim_options, calculate_column_widths,
+    cleanup_preview_dir, determine_skim_action, flush_preview_chunk, format_row_display,
+    preview_dir, read_row_from_chunk, App, AppState, ResultRowItem, SimpleSkimItem, SkimAction,
 };
 
 impl App {
@@ -45,23 +44,24 @@ impl App {
         // current_database が判明している場合は "SHOW TABLES FROM `<db>`" に書き換えることで
         // セッション状態に依存しないステートレスなクエリにする。
         if let Some(db) = self.current_database.clone() {
-            let trimmed = self.query_input.trim().to_uppercase();
+            let trimmed = self.sql.text.trim().to_uppercase();
             if trimmed == "SHOW TABLES" || trimmed == "SHOW TABLES;" {
-                let new_query = format!("SHOW TABLES FROM {}", crate::query::escape_identifier(&db));
-                self.cursor_position = new_query.chars().count();
-                self.query_input = new_query;
+                let new_query =
+                    format!("SHOW TABLES FROM {}", crate::query::escape_identifier(&db));
+                self.sql.cursor_position = new_query.chars().count();
+                self.sql.text = new_query;
             }
         }
 
         // 次の show_result_with_skim でテーブル名を抽出できるよう保存する
-        self.last_sql = self.query_input.clone();
+        self.sql.last_sql = self.sql.text.clone();
 
         // タイムアウト値はmanagerのconfig経由で取得する
         let timeout_secs = manager.config().mysql.timeout;
 
         self.state = AppState::StreamingQuery {
             manager,
-            sql: self.query_input.clone(),
+            sql: self.sql.text.clone(),
             timeout_secs,
         };
 
@@ -111,7 +111,6 @@ impl App {
         pool: &sqlx::Pool<sqlx::MySql>,
         _timeout: std::time::Duration,
         current_database: Option<&str>,
-        terminal: &mut ratatui::Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>,
     ) -> Result<Option<String>> {
         let rt_handle = tokio::runtime::Handle::current();
         let pool = pool.clone();
@@ -130,7 +129,9 @@ impl App {
                 rt_handle_clone.block_on(async {
                     use sqlx::Row;
                     let query = match current_db_clone.as_deref() {
-                        Some(db) => format!("SHOW TABLES FROM {}", crate::query::escape_identifier(db)),
+                        Some(db) => {
+                            format!("SHOW TABLES FROM {}", crate::query::escape_identifier(db))
+                        }
                         None => "SHOW TABLES".to_string(),
                     };
                     let rows = sqlx::query(&query)
@@ -158,12 +159,6 @@ impl App {
         if tables.is_empty() {
             return Err(Error::Other("テーブルが見つかりません".to_string()));
         }
-
-        // テーブル一覧取得完了後・skim起動直前にTUIを離脱してちらつきを防ぐ
-        crossterm::terminal::disable_raw_mode()
-            .map_err(|e| Error::Tui(format!("ターミナル復元失敗: {}", e)))?;
-        crossterm::execute!(terminal.backend_mut(), crossterm::terminal::LeaveAlternateScreen)
-            .map_err(|e| Error::Tui(format!("ターミナル復元失敗: {}", e)))?;
 
         // Step 2: skimでテーブル選択（single select）
         let table_name = {
@@ -197,25 +192,17 @@ impl App {
         };
 
         // Step 3: SHOW COLUMNS FROM テーブル名 でカラム一覧取得
-        // current_database が指定されている場合は <db>.<table> 形式で参照し
-        // セッションのデフォルトDBに依存しないステートレスなクエリにする
         let columns: Vec<String> = {
             let pool_clone = pool.clone();
             let table_name_clone = table_name.clone();
-            let current_db_clone2 = current_db.clone();
             let rt_handle_clone = rt_handle.clone();
             let handle = std::thread::spawn(move || {
                 rt_handle_clone.block_on(async {
                     use sqlx::Row;
-                    let qualified = match current_db_clone2.as_deref() {
-                        Some(db) => format!(
-                            "{}.{}",
-                            crate::query::escape_identifier(db),
-                            crate::query::escape_identifier(&table_name_clone)
-                        ),
-                        None => crate::query::escape_identifier(&table_name_clone),
-                    };
-                    let sql = format!("SHOW COLUMNS FROM {}", qualified);
+                    let sql = format!(
+                        "SHOW COLUMNS FROM {}",
+                        crate::query::escape_identifier(&table_name_clone)
+                    );
                     let rows = sqlx::query(&sql)
                         .fetch_all(&pool_clone)
                         .await
@@ -282,21 +269,16 @@ impl App {
         };
 
         // Step 5: SELECT文を生成
-        // current_database が指定されている場合は <db>.<table> 形式で参照する
         let col_list = selected_columns
             .iter()
             .map(|c| crate::query::escape_identifier(c))
             .collect::<Vec<_>>()
             .join(", ");
-        let qualified_table = match current_db.as_deref() {
-            Some(db) => format!(
-                "{}.{}",
-                crate::query::escape_identifier(db),
-                crate::query::escape_identifier(&table_name)
-            ),
-            None => crate::query::escape_identifier(&table_name),
-        };
-        let sql = format!("SELECT {} FROM {}", col_list, qualified_table);
+        let sql = format!(
+            "SELECT {} FROM {}",
+            col_list,
+            crate::query::escape_identifier(&table_name)
+        );
 
         Ok(Some(sql))
     }
@@ -307,13 +289,16 @@ impl App {
     /// USE文以外のコマンドでは何もしない。
     /// DB切り替え時はテーブル選択をリセットする。
     pub(super) fn update_current_database(&mut self) {
-        let sql_upper = self.last_sql.trim().to_uppercase();
+        let sql_upper = self.sql.last_sql.trim().to_uppercase();
         if sql_upper.starts_with("USE ") {
             // "USE `db_name`" または "USE db_name" の形式に対応する
-            let db_name = self.last_sql.trim()["USE ".len()..]
+            // セミコロンを先に除去しないと `foo`; のようにバッククォートが末尾に残るため、
+            // trim_end_matches(';') → trim() → trim_matches('`') の順で処理する
+            let db_name = self.sql.last_sql.trim()["USE ".len()..]
+                .trim()
+                .trim_end_matches(';')
                 .trim()
                 .trim_matches('`')
-                .trim_end_matches(';')
                 .to_string();
             if !db_name.is_empty() {
                 tracing::info!("Database changed to: {}", db_name);
@@ -332,7 +317,6 @@ impl App {
     pub(super) fn show_result_with_skim(
         &mut self,
         result: &QueryResult,
-        terminal: &mut ratatui::Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>,
     ) -> Result<Option<SkimAction>> {
         // 多カラム表示で見切れる問題に対処するため、プレビューペインに選択行の全カラムを縦表示する。
         // {n} はskimのフィルタ後0ベースインデックスに置換されるため、元データとのマッピングには
@@ -370,8 +354,8 @@ impl App {
         let header_line = format_row_display(&result.columns, &col_widths);
 
         // previewコマンド: チャンクファイルから該当行を高速検索
-        // self.last_sql からテーブル名を抽出してプレビューのヘッダーに表示する
-        let table_name = crate::completion::extract_from_table(&self.last_sql);
+        // self.sql.last_sql からテーブル名を抽出してプレビューのヘッダーに表示する
+        let table_name = crate::completion::extract_from_table(&self.sql.last_sql);
         // パンくずリスト用にテーブル名を更新する
         self.current_table = table_name.clone();
         let preview_cmd = build_preview_cmd(&pdir, table_name.as_deref());
@@ -384,12 +368,6 @@ impl App {
             let _ = tx.send(item);
         }
         drop(tx);
-
-        // データ準備完了後・skim起動直前にTUIを離脱することでちらつきを防ぐ
-        crossterm::terminal::disable_raw_mode()
-            .map_err(|e| crate::error::Error::Tui(format!("ターミナル復元失敗: {}", e)))?;
-        crossterm::execute!(terminal.backend_mut(), crossterm::terminal::LeaveAlternateScreen)
-            .map_err(|e| crate::error::Error::Tui(format!("ターミナル復元失敗: {}", e)))?;
 
         let skim_output = Skim::run_with(&options, Some(rx));
 
@@ -433,7 +411,13 @@ impl App {
         }
 
         let first_column = result.columns.first().map(|s| s.as_str()).unwrap_or("");
-        let action = determine_skim_action(first_column, first_value, &result.columns, row_data, &self.last_sql);
+        let action = determine_skim_action(
+            first_column,
+            first_value,
+            &result.columns,
+            row_data,
+            &self.sql.last_sql,
+        );
 
         Ok(Some(action))
     }
@@ -448,7 +432,6 @@ impl App {
         pool: sqlx::Pool<sqlx::MySql>,
         sql: &str,
         query_timeout: std::time::Duration,
-        terminal: &mut ratatui::Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>,
     ) -> Result<Option<SkimAction>> {
         use std::sync::mpsc;
 
@@ -457,7 +440,8 @@ impl App {
         // バックグラウンドスレッドからカラム情報とカラム幅、または初期フェッチエラーを受け取るチャネル
         // 最初の100行をサンプリングしてカラム幅を決定してから送信する
         // エラー発生時はErrを送信し、skim起動前にエラーを検出できるようにする
-        let (col_tx, col_rx) = mpsc::channel::<std::result::Result<(Vec<String>, Vec<usize>), String>>();
+        let (col_tx, col_rx) =
+            mpsc::channel::<std::result::Result<(Vec<String>, Vec<usize>), String>>();
 
         // プレビュー用チャンクディレクトリ
         let pdir = preview_dir();
@@ -488,7 +472,7 @@ impl App {
                         Ok(c) => Some(c),
                         Err(e) => {
                             let _ = col_tx.send(Err(format!("コネクション取得失敗: {}", e)));
-                            return (Vec::new(), Vec::new());
+                            return (Vec::new(), 0);
                         }
                     }
                 } else {
@@ -503,11 +487,9 @@ impl App {
                     // &str の Execute 実装は take_arguments() == None を返すため、
                     // MySQL ドライバは prepared statement を使わず COM_QUERY を発行する
                     let use_stmt = format!("USE {}", crate::query::escape_identifier(db));
-                    if let Err(e) = (&mut **conn).execute(use_stmt.as_str())
-                        .await
-                    {
+                    if let Err(e) = (&mut **conn).execute(use_stmt.as_str()).await {
                         let _ = col_tx.send(Err(format!("USE {} 失敗: {}", db, e)));
-                        return (Vec::new(), Vec::new());
+                        return (Vec::new(), 0);
                     }
                 }
 
@@ -520,9 +502,8 @@ impl App {
                 let mut columns: Vec<String> = Vec::new();
                 let mut row_index: usize = 0;
                 let mut chunk_buf = String::new();
-                // skim選択後に行インデックスで元データを参照できるよう全行を保持する
-                // display_textからの逆パースはマルチバイト文字でバイト位置がずれるため使用しない
-                let mut all_rows: Vec<Vec<String>> = Vec::new();
+                // all_rows は廃止: skim選択後の行データはチャンクファイルから読み出す
+                // （数百万行のクエリ結果での OOM を防ぐため）
 
                 // Phase 1: 最初の100行をバッファしてカラム幅を決定
                 // タイムアウトは最初の行が来るまでの接続確認として適用する
@@ -539,9 +520,10 @@ impl App {
                         Err(_elapsed) => {
                             // タイムアウト：サーバーからの応答が設定時間内に来なかった
                             let _ = col_tx.send(Err(
-                                "クエリのタイムアウト：サーバーからの応答がありませんでした".to_string()
+                                "クエリのタイムアウト：サーバーからの応答がありませんでした"
+                                    .to_string(),
                             ));
-                            return (Vec::new(), Vec::new());
+                            return (Vec::new(), 0);
                         }
                         Ok(opt) => opt,
                     };
@@ -557,16 +539,12 @@ impl App {
                             // SQLエラー（構文エラー・権限エラー等）をメインスレッドに通知
                             tracing::error!("Streaming query error: {}", e);
                             let _ = col_tx.send(Err(format!("クエリ実行エラー: {}", e)));
-                            return (Vec::new(), Vec::new());
+                            return (Vec::new(), 0);
                         }
                     };
 
                     if columns.is_empty() {
-                        columns = row
-                            .columns()
-                            .iter()
-                            .map(|c| c.name().to_string())
-                            .collect();
+                        columns = row.columns().iter().map(|c| c.name().to_string()).collect();
                     }
 
                     let data: Vec<String> = row
@@ -584,9 +562,20 @@ impl App {
                 }
 
                 // 空結果でも列ヘッダーを表示するためにメタデータを補完する
-                // execute_query 側と同じ describe() を使って一貫性を保つ
+                // 専用コネクション(conn_opt)が存在する場合はそちらを使い、USEで切り替えた
+                // セッション状態を維持する。プールから別のコネクションを取得すると
+                // USE実行前のDBに対して describe が実行されてしまう。
                 if sample_rows.is_empty() && columns.is_empty() {
-                    match pool.describe(sql_owned.as_str()).await {
+                    // stream が conn_opt を借用しているため、describe前にdropする。
+                    // 空結果の場合はPhase 2でストリームを再利用しないため安全。
+                    drop(stream);
+
+                    let describe_result = if let Some(ref mut conn) = conn_opt {
+                        (&mut **conn).describe(sql_owned.as_str()).await
+                    } else {
+                        pool.describe(sql_owned.as_str()).await
+                    };
+                    match describe_result {
                         Ok(describe) => {
                             use sqlx::Column as SqlxColumnDesc;
                             columns = describe
@@ -599,6 +588,13 @@ impl App {
                             tracing::warn!("describe failed for empty streaming result: {}", e);
                         }
                     }
+
+                    // カラム幅を計算してメインスレッドに通知（成功）
+                    let col_widths = calculate_column_widths(&columns, &sample_rows);
+                    let _ = col_tx.send(Ok((columns.clone(), col_widths.clone())));
+                    // 空結果なのでPhase 2は不要、早期リターン
+                    flush_preview_chunk(&pdir_clone, 0, &chunk_buf);
+                    return (columns, row_index);
                 }
 
                 // カラム幅を計算してメインスレッドに通知（成功）
@@ -609,23 +605,28 @@ impl App {
                 for data in &sample_rows {
                     let display = format_row_display(data, &col_widths);
 
-                    let item = Arc::new(ResultRowItem { row_index, display })
-                        as Arc<dyn SkimItem>;
+                    let item = Arc::new(ResultRowItem { row_index, display }) as Arc<dyn SkimItem>;
                     if skim_tx.send(item).is_err() {
-                        // skimが閉じてもall_rowsの蓄積は継続しない（以降の行は参照されない）
-                        all_rows.extend(sample_rows.into_iter().take(row_index));
+                        // skimが閉じた時点でチャンクファイルへの書き出しを完了してスレッドを終了する
+                        // 未書き出しのサンプル行分をチャンクに追記してから flush する
+                        for d in sample_rows.iter().skip(row_index) {
+                            append_preview_to_chunk(
+                                &pdir_clone,
+                                row_index,
+                                &columns,
+                                d,
+                                &mut chunk_buf,
+                            );
+                            row_index += 1;
+                        }
                         flush_preview_chunk(&pdir_clone, row_index.saturating_sub(1), &chunk_buf);
-                        return (columns, all_rows);
+                        return (columns, row_index);
                     }
 
-                    append_preview_to_chunk(
-                        &pdir_clone, row_index, &columns, data, &mut chunk_buf,
-                    );
+                    append_preview_to_chunk(&pdir_clone, row_index, &columns, data, &mut chunk_buf);
 
                     row_index += 1;
                 }
-                // サンプル行をall_rowsに移動
-                all_rows.extend(sample_rows);
 
                 // Phase 2: 残りの行をストリーミング送信
                 // データが流れ始めたため、ここではタイムアウトを適用しない（ユーザーがESCで中断できる）
@@ -647,8 +648,7 @@ impl App {
 
                     let display = format_row_display(&data, &col_widths);
 
-                    let item = Arc::new(ResultRowItem { row_index, display })
-                        as Arc<dyn SkimItem>;
+                    let item = Arc::new(ResultRowItem { row_index, display }) as Arc<dyn SkimItem>;
                     if skim_tx.send(item).is_err() {
                         tracing::debug!(
                             "skim channel closed, stopping stream at row {}",
@@ -658,17 +658,20 @@ impl App {
                     }
 
                     append_preview_to_chunk(
-                        &pdir_clone, row_index, &columns, &data, &mut chunk_buf,
+                        &pdir_clone,
+                        row_index,
+                        &columns,
+                        &data,
+                        &mut chunk_buf,
                     );
 
-                    all_rows.push(data);
                     row_index += 1;
                 }
 
                 // 最終チャンクを書き出し
                 flush_preview_chunk(&pdir_clone, row_index.saturating_sub(1), &chunk_buf);
 
-                (columns, all_rows)
+                (columns, row_index)
             })
         });
 
@@ -702,39 +705,34 @@ impl App {
 
         let options = build_result_skim_options(&header_line, &preview_cmd, &prompt_str)?;
 
-        // サンプリング完了後・skim起動直前にTUIを離脱することでちらつきを防ぐ
-        // LeaveAlternateScreen を skim 起動直前まで遅延させることで素のターミナルが見える時間をゼロにする
-        crossterm::terminal::disable_raw_mode()
-            .map_err(|e| crate::error::Error::Tui(format!("ターミナル復元失敗: {}", e)))?;
-        crossterm::execute!(terminal.backend_mut(), crossterm::terminal::LeaveAlternateScreen)
-            .map_err(|e| crate::error::Error::Tui(format!("ターミナル復元失敗: {}", e)))?;
-
         // skim_rxの送信側はバックグラウンドスレッドが保持しているため、skimが閉じると自動的にストリームが終了する
         let skim_output = Skim::run_with(&options, Some(skim_rx));
 
-        cleanup_preview_dir(&pdir);
-
         // バックグラウンドスレッドの終了を待つ
         // skimが閉じると skim_tx.send() が Err を返してバックグラウンドスレッドがbreakする
-        let (columns, all_rows) = match handle.join() {
+        // all_rows は廃止したため、スレッドの戻り値は (columns, total_rows) になっている
+        let (columns, _total_rows) = match handle.join() {
             Ok(data) => data,
             Err(e) => {
                 // パニックは通常発生しないが、発生した場合もUIを継続できるようエラーログに留める
                 tracing::error!("ストリーミングスレッドがパニックしました: {:?}", e);
-                (Vec::new(), Vec::new())
+                (Vec::new(), 0)
             }
         };
 
         // キャンセルされた場合
         let Some(output) = skim_output else {
+            cleanup_preview_dir(&pdir);
             return Ok(None);
         };
 
         if output.is_abort {
+            cleanup_preview_dir(&pdir);
             return Ok(None);
         }
 
         let Some(selected_item) = output.selected_items.first() else {
+            cleanup_preview_dir(&pdir);
             return Ok(None);
         };
 
@@ -745,11 +743,12 @@ impl App {
             .downcast_ref::<ResultRowItem>()
             .ok_or_else(|| Error::Other("選択された行の情報を復元できません".to_string()))?;
 
-        // 行インデックスで元データを直接参照する
-        // display_textからの固定幅逆パースはマルチバイト文字でバイト位置がずれるため使用しない
-        let row_data = all_rows
-            .get(result_item.row_index)
-            .ok_or_else(|| Error::Other("選択された行が見つかりません".to_string()))?;
+        // skim選択後の行データをチャンクファイルから読み出す
+        // all_rows をメモリ上に保持しないことで数百万行のクエリ結果でも OOM にならない
+        // read_row_from_chunk の後でクリーンアップするため、チャンクファイルは確実に存在する
+        let row_data = read_row_from_chunk(&pdir, result_item.row_index, &columns);
+        cleanup_preview_dir(&pdir);
+        let row_data = row_data?;
 
         let first_value = row_data.first().map(|s| s.as_str()).unwrap_or("");
 
@@ -758,9 +757,8 @@ impl App {
         }
 
         let first_column = columns.first().map(|s| s.as_str()).unwrap_or("");
-        let action = determine_skim_action(first_column, first_value, &columns, row_data, sql);
+        let action = determine_skim_action(first_column, first_value, &columns, &row_data, sql);
 
         Ok(Some(action))
     }
-
 }

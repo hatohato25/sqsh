@@ -19,11 +19,11 @@ name = "local-dev"
 # bastion = false
 
 [connections.mysql]
-host = "127.0.0.1"
-port = 13306
-database = "testdb"
-user = "testuser"
-password = "testpass"
+host = "localhost"
+port = 3306
+database = "your_database"
+user = "your_db_user"
+password = "your_password"
 timeout = 30
 # ssl_mode: "required" (default, recommended), "preferred", or "disabled"
 ssl_mode = "disabled"  # disabled is acceptable for local development
@@ -38,7 +38,6 @@ idle_timeout = 300    # Idle connection timeout in seconds (default: 300)
 # ---------------------------------------------------------------------------
 [[connections]]
 name = "production"
-readonly = true  # Mark connection as read-only (prevents accidental writes)
 
 [connections.bastion]
 host = "bastion.example.com"  # Bastion server hostname or IP
@@ -66,6 +65,7 @@ idle_timeout = 600
 # ---------------------------------------------------------------------------
 [[connections]]
 name = "staging"
+readonly = true  # Mark connection as read-only (prevents accidental writes)
 
 [connections.bastion]
 host = "10.0.0.1"   # Bastion server IP address

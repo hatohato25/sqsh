@@ -2,8 +2,6 @@
 
 A TUI MySQL client for fast database exploration with fuzzy search, written in Rust.
 
-![demo](https://github.com/hatohato25/sqsh/releases/download/v0.1.0/t-rec.gif)
-
 ## Features
 
 - **Bastion Support**: Connect to MySQL through SSH bastion servers with per-connection or shared bastion configuration
@@ -11,12 +9,9 @@ A TUI MySQL client for fast database exploration with fuzzy search, written in R
 - **Fuzzy Finder**: Quick connection and table selection with skim (Rust-native fzf)
 - **TOML Configuration**: Manage multiple connections in a single config file
 - **Connection Pooling**: Configurable connection pool with global defaults and per-connection overrides
-- **Read-only Mode**: Prevent accidental writes on sensitive connections
+- **Shell Input**: Run shell commands from within sqsh (executes on bastion when connected via bastion)
+- **Read-only Mode**: Prevent accidental writes with client-side SQL detection and server-side session enforcement
 - **Secure**: Memory-zeroed password handling, TLS/SSL support, config file permission checks
-
-## Website
-
-https://hatohato25.github.io/sqsh/
 
 ## Installation
 
@@ -239,14 +234,15 @@ Connection selection is handled by skim (Rust-native fzf). Standard fzf key bind
 
 ### SQL Input
 
-SQL input is handled directly by sqsh.
+SQL input is handled directly by sqsh. Press `Tab` to switch focus between SQL Input and Shell Input.
 
 #### Execution and Completion
 
 | Key | Action |
 |-----|--------|
 | `Enter` | Execute SQL |
-| `Tab` / `Down` | Next completion candidate |
+| `Tab` | Switch focus to Shell Input (when completion popup is closed) |
+| `Tab` / `Down` | Next completion candidate (when completion popup is open) |
 | `Shift+Tab` / `Up` | Previous completion candidate |
 | `Ctrl+D` | Execute `SHOW DATABASES` |
 | `Ctrl+T` | Execute `SHOW TABLES` |
@@ -278,6 +274,26 @@ SQL input is handled directly by sqsh.
 | `ESC` | Clear input / close completion popup |
 | `q` (empty input) | Quit |
 
+### Shell Input
+
+Shell Input allows running shell commands without leaving sqsh. Press `Tab` to switch focus from SQL Input.
+
+When connected via a bastion server, commands execute on the bastion host. For direct connections, commands execute locally.
+
+| Key | Action |
+|-----|--------|
+| `Enter` | Execute command |
+| `Tab` | Switch focus to SQL Input |
+| `Up` / `Down` | Navigate shell history |
+| `Ctrl+A` / `Home` | Move cursor to start |
+| `Ctrl+E` / `End` | Move cursor to end |
+| `Ctrl+K` | Delete from cursor to end |
+| `Ctrl+U` | Delete from start to cursor |
+| `Ctrl+W` | Delete previous word |
+| `Alt+←` / `Alt+→` | Move cursor one word left / right |
+| `ESC` | Clear input |
+| `Ctrl+C` | Quit |
+
 ### Result Viewer
 
 Result display is handled by skim (Rust-native fzf). Standard fzf key bindings apply.
@@ -288,73 +304,6 @@ Result display is handled by skim (Rust-native fzf). Standard fzf key bindings a
 | `Up` / `Down` | Scroll through results |
 | `Enter` | Select record (generates WHERE template) |
 | `ESC` / `Ctrl+C` | Return to SQL input |
-
-## Local Testing with Docker
-
-The repository ships with a `docker-compose.yml` and initialization scripts under `docker/init/` that spin up a MySQL 8.0 instance pre-loaded with several sample databases.
-
-### Available sample databases
-
-| Database | Description |
-|----------|-------------|
-| `testdb` | Basic users / products / orders |
-| `ecommerce` | Customers, items, transactions, reviews |
-| `blog` | Authors, posts, comments, tags |
-| `analytics` | Events (~1M rows), sessions, page views |
-| `inventory` | Warehouses, products, stock levels, shipments |
-| `hr_system` | Departments, employees, projects, time entries |
-
-### Steps
-
-**1. Start the MySQL container**
-
-```bash
-docker compose up -d
-```
-
-Wait until the container reports healthy (the init scripts run automatically on first start; the `analytics.events` table takes a minute to populate ~1M rows):
-
-```bash
-docker compose ps          # STATUS should show "healthy"
-```
-
-**2. Create a config file**
-
-```bash
-mkdir -p ~/.config/sqsh
-cp config.example.toml ~/.config/sqsh/config.toml
-chmod 600 ~/.config/sqsh/config.toml
-```
-
-Then edit `~/.config/sqsh/config.toml` so the `local-dev` connection points to the Docker instance:
-
-```toml
-[[connections]]
-name = "local-dev"
-
-[connections.mysql]
-host     = "127.0.0.1"
-port     = 13306          # mapped port in docker-compose.yml
-database = "testdb"
-user     = "testuser"
-password = "testpass"
-ssl_mode = "disabled"
-```
-
-**3. Launch sqsh**
-
-```bash
-sqsh
-```
-
-Select `local-dev` from the connection picker and start exploring.
-
-### Stopping and cleaning up
-
-```bash
-docker compose down          # stop containers, keep volume
-docker compose down -v       # stop containers and remove volume
-```
 
 ## Development
 

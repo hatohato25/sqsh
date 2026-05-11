@@ -465,3 +465,107 @@ async fn test_bastion_config_presence() {
 
     // 実際の接続は環境がないため試行しない（上記のtest_bastion_connectionで実施）
 }
+
+/// readonlyモードのテスト: 全pooled connectionでwriteがブロックされることを確認
+///
+/// after_connect コールバックで全物理コネクションに
+/// SET SESSION transaction_read_only = ON が適用されることを検証する
+#[tokio::test]
+async fn test_readonly_mode_blocks_writes_across_pool() {
+    if skip_if_docker_unavailable("test_readonly_mode_blocks_writes_across_pool") {
+        return;
+    }
+
+    let docker = Cli::default();
+    let mysql_container = docker.run(Mysql::default());
+    let host = "127.0.0.1";
+    let port = mysql_container.get_host_port_ipv4(3306);
+
+    let config = create_test_mysql_config(host, port);
+
+    // readonly=true で接続する
+    let manager = ConnectionManager::connect(config, true)
+        .await
+        .expect("testcontainers で起動した MySQL へ readonly 接続できるはず");
+    let pool = manager.pool();
+
+    // テーブル作成（readonlyはDML制限なのでDDLは通る場合があるが、MySQL8ではDDLもブロックされる）
+    // SELECTは通るはず
+    let select_result = sqlx::query("SELECT 1 as value").fetch_one(pool).await;
+    assert!(
+        select_result.is_ok(),
+        "readonlyモードでもSELECTは実行できる"
+    );
+
+    // 複数回プールからコネクションを取得してwriteを試行し、
+    // 全てのコネクションでブロックされることを確認する
+    // （after_connectが全コネクションに適用されていることの検証）
+    for i in 0..3 {
+        let write_result = sqlx::query("CREATE TABLE IF NOT EXISTS readonly_test (id INT)")
+            .execute(pool)
+            .await;
+        assert!(
+            write_result.is_err(),
+            "readonlyモードではwrite操作が全てのpooled connectionでブロックされる (attempt {})",
+            i + 1
+        );
+    }
+
+    manager.close().await;
+}
+
+/// readonlyモードでINSERTがブロックされることを確認
+#[tokio::test]
+async fn test_readonly_mode_blocks_insert() {
+    if skip_if_docker_unavailable("test_readonly_mode_blocks_insert") {
+        return;
+    }
+
+    let docker = Cli::default();
+    let mysql_container = docker.run(Mysql::default());
+    let host = "127.0.0.1";
+    let port = mysql_container.get_host_port_ipv4(3306);
+
+    let mut config = create_test_mysql_config(host, port);
+    // max_connections を大きめにしてプール拡張時のテストを行う
+    config.mysql.pool = PoolConfigPartial {
+        max_connections: Some(5),
+        idle_timeout: None,
+    };
+
+    // まず通常モードで接続してテーブルを作成
+    let setup_manager = ConnectionManager::connect(config.clone(), false)
+        .await
+        .expect("セットアップ用接続");
+    let setup_pool = setup_manager.pool();
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS readonly_insert_test (id INT PRIMARY KEY, name VARCHAR(50))",
+    )
+    .execute(setup_pool)
+    .await
+    .expect("テーブル作成");
+    setup_manager.close().await;
+
+    // readonlyモードで再接続
+    let manager = ConnectionManager::connect(config, true)
+        .await
+        .expect("readonly接続");
+    let pool = manager.pool();
+
+    // SELECTは成功する
+    let select_result =
+        query::execute_query(pool, "SELECT * FROM readonly_insert_test", None).await;
+    assert!(select_result.is_ok(), "readonlyモードでSELECTは成功する");
+
+    // INSERTはサーバー側でブロックされる
+    let insert_result =
+        sqlx::query("INSERT INTO readonly_insert_test (id, name) VALUES (1, 'test')")
+            .execute(pool)
+            .await;
+    assert!(
+        insert_result.is_err(),
+        "readonlyモードでINSERTはサーバー側でブロックされる"
+    );
+
+    manager.close().await;
+}

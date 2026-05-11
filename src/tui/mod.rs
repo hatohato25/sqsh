@@ -1,23 +1,20 @@
+use crate::completion::{CompletionCache, CompletionItem};
+use ::skim::prelude::*;
 use crossterm::{
     event::{self},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
-use ratatui::{
-    backend::CrosstermBackend,
-    Terminal,
-};
-use crate::completion::{CompletionCache, CompletionItem};
-use ::skim::prelude::*;
+use ratatui::{backend::CrosstermBackend, Terminal};
 use std::borrow::Cow;
 use std::collections::VecDeque;
-use unicode_width::UnicodeWidthStr;
 use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::task::JoinHandle;
+use unicode_width::UnicodeWidthStr;
 
-use crate::config::Config;
+use crate::config::{BastionConfig, BastionSetting, Config};
 use crate::connection::ConnectionManager;
 use crate::error::{Error, Result};
 use crate::i18n::TuiMsg;
@@ -76,13 +73,19 @@ impl SkimItem for ResultRowItem {
     }
 }
 
-
 /// 書き込み系SQLかどうかを判定する
 ///
 /// readonlyモードでブロックすべきSQL文のプレフィックスをチェックする。
 /// サーバー側でもブロックされるが、ユーザーへの即時フィードバックのためクライアントでも検査する。
+/// `/* ... */` や `-- ...` で始まるコメントは読み飛ばして先頭の意味あるトークンを判定する。
 pub(super) fn is_write_sql(sql: &str) -> bool {
-    let first_token = sql.split_whitespace().next().unwrap_or("").to_uppercase();
+    let first_token = first_meaningful_token(sql).to_uppercase();
+
+    // WITH句（CTE）の場合、本体のDML部分を確認する
+    if first_token == "WITH" {
+        return cte_contains_write(sql);
+    }
+
     matches!(
         first_token.as_str(),
         "INSERT"
@@ -97,6 +100,89 @@ pub(super) fn is_write_sql(sql: &str) -> bool {
             | "GRANT"
             | "REVOKE"
     )
+}
+
+/// CTE（WITH句）の本体部分が書き込みDMLかどうかを簡易判定する
+///
+/// WITH句の後に続くCTE定義（`name AS (...)`）を括弧のネストで追跡し、
+/// 全CTE定義の終了後（depth==0 の `)` の後にカンマが続かない位置）の
+/// 先頭トークンがDML書き込みキーワードかを確認する。
+///
+/// 完全なSQLパーサーではないため、極端にネストしたCTEでは誤判定の可能性があるが、
+/// サーバー側のreadonly制約がバックアップとして機能する。
+fn cte_contains_write(sql: &str) -> bool {
+    let upper = sql.to_uppercase();
+    let write_keywords = ["INSERT", "UPDATE", "DELETE"];
+
+    // WITH句の後から走査を開始する
+    let start = match upper.find("WITH") {
+        Some(pos) => pos + 4,
+        None => return false,
+    };
+
+    let bytes = upper.as_bytes();
+    let len = bytes.len();
+    let mut depth = 0i32;
+    let mut i = start;
+
+    while i < len {
+        match bytes[i] {
+            b'(' => {
+                depth += 1;
+                i += 1;
+            }
+            b')' => {
+                depth -= 1;
+                i += 1;
+                // depth が 0 に戻った＝1つのCTE定義の括弧が閉じた
+                if depth == 0 {
+                    // カンマが続く場合はさらにCTE定義が続くのでスキップする
+                    let remaining = upper[i..].trim_start();
+                    if remaining.starts_with(',') {
+                        // カンマの次のCTE定義へ進む
+                        i += upper[i..].len() - remaining.len() + 1;
+                        continue;
+                    }
+                    // カンマ以外が続く場合は全CTE定義が終わりDML本体に到達している
+                    let token = remaining.split_whitespace().next().unwrap_or("");
+                    return write_keywords.contains(&token);
+                }
+            }
+            _ => {
+                i += 1;
+            }
+        }
+    }
+
+    false
+}
+
+/// SQLの先頭コメント（`/* ... */` および `-- ...`）を読み飛ばし、最初の意味あるトークンを返す
+///
+/// コメントのみのSQLや閉じていないブロックコメントの場合は空文字列を返す。
+fn first_meaningful_token(sql: &str) -> &str {
+    let mut s = sql.trim();
+    loop {
+        if s.starts_with("/*") {
+            // ブロックコメントを飛ばす
+            if let Some(end) = s.find("*/") {
+                s = s[end + 2..].trim_start();
+            } else {
+                // 閉じないブロックコメント: 残り全体がコメント扱い
+                return "";
+            }
+        } else if s.starts_with("--") {
+            // 行コメントを飛ばす
+            if let Some(newline) = s.find('\n') {
+                s = s[newline + 1..].trim_start();
+            } else {
+                return "";
+            }
+        } else {
+            break;
+        }
+    }
+    s.split_whitespace().next().unwrap_or("")
 }
 
 /// 文字列を表示幅ベースで固定幅にパディングする
@@ -201,7 +287,11 @@ pub(super) fn append_preview_to_chunk(
             chunk_buf.as_str(),
         ) {
             // 書き込み失敗時はプレビューが表示されないだけで致命的ではないためwarnログに留める
-            tracing::warn!("プレビューチャンクの書き込みに失敗しました (chunk={}): {}", chunk_idx, e);
+            tracing::warn!(
+                "プレビューチャンクの書き込みに失敗しました (chunk={}): {}",
+                chunk_idx,
+                e
+            );
         }
         chunk_buf.clear();
     }
@@ -213,7 +303,11 @@ pub(super) fn flush_preview_chunk(dir: &std::path::Path, row_index: usize, chunk
         let chunk_idx = row_index / PREVIEW_CHUNK_SIZE;
         if let Err(e) = std::fs::write(dir.join(format!("chunk_{}.txt", chunk_idx)), chunk_buf) {
             // 書き込み失敗時はプレビューが表示されないだけで致命的ではないためwarnログに留める
-            tracing::warn!("最終プレビューチャンクの書き込みに失敗しました (chunk={}): {}", chunk_idx, e);
+            tracing::warn!(
+                "最終プレビューチャンクの書き込みに失敗しました (chunk={}): {}",
+                chunk_idx,
+                e
+            );
         }
     }
 }
@@ -245,6 +339,65 @@ pub(super) fn build_preview_cmd(dir: &std::path::Path, table_name: Option<&str>)
         dir_escaped = dir_escaped,
         header_part = header_part
     )
+}
+
+/// チャンクファイルから指定行のデータを読み出す
+///
+/// `append_preview_to_chunk` が書き出すフォーマット（`col_name: value\n` + `---\n` 区切り）を
+/// パースして各カラムの値を Vec<String> として返す。
+/// `all_rows` をメモリ上に保持せずに済むため、数百万行のクエリ結果でも OOM にならない。
+pub(super) fn read_row_from_chunk(
+    dir: &std::path::Path,
+    row_index: usize,
+    columns: &[String],
+) -> crate::error::Result<Vec<String>> {
+    let chunk_idx = row_index / PREVIEW_CHUNK_SIZE;
+    let row_in_chunk = row_index % PREVIEW_CHUNK_SIZE;
+
+    let chunk_path = dir.join(format!("chunk_{}.txt", chunk_idx));
+    let content = std::fs::read_to_string(&chunk_path).map_err(|e| {
+        crate::error::Error::Other(format!(
+            "チャンクファイルの読み込みに失敗しました (row={}): {}",
+            row_index, e
+        ))
+    })?;
+
+    // `---\n` で区切られたレコードの中から対象行を取得する
+    // split("---\n") は末尾の区切り文字の後に空文字列要素を生成するため、
+    // 空のレコードは存在しない行として扱う
+    let records: Vec<&str> = content.split("---\n").filter(|r| !r.is_empty()).collect();
+    let record = records.get(row_in_chunk).ok_or_else(|| {
+        crate::error::Error::Other(format!(
+            "選択された行がチャンクファイル内に見つかりません (row={}, chunk={})",
+            row_index, chunk_idx
+        ))
+    })?;
+
+    // `col_name: value\n` 形式の各行からvalueを抽出する
+    // カラム名に ": " が含まれる可能性を考慮し、カラム名リストを使って先頭マッチで分割する
+    let mut values: Vec<String> = Vec::with_capacity(columns.len());
+    let lines: Vec<&str> = record.lines().collect();
+
+    for (i, col_name) in columns.iter().enumerate() {
+        let prefix = format!("{}: ", col_name);
+        if let Some(line) = lines.get(i) {
+            if let Some(value) = line.strip_prefix(&prefix) {
+                values.push(value.to_string());
+            } else {
+                // プレフィックスが一致しない場合（カラム名に":"が含まれる等のエッジケース）
+                // ": " の最初の出現位置で分割するフォールバック
+                if let Some(colon_pos) = line.find(": ") {
+                    values.push(line[colon_pos + 2..].to_string());
+                } else {
+                    values.push(line.to_string());
+                }
+            }
+        } else {
+            values.push(String::new());
+        }
+    }
+
+    Ok(values)
 }
 
 /// プレビュー用ディレクトリを削除
@@ -286,9 +439,7 @@ pub(super) fn build_result_skim_options<'a>(
         .preview_window(Some("right:30%:wrap"))
         .no_mouse(true)
         .build()
-        .map_err(|e| {
-            crate::error::Error::Other(format!("{}: {:?}", t!(TuiMsg::SkimInitError), e))
-        })
+        .map_err(|e| crate::error::Error::Other(format!("{}: {:?}", t!(TuiMsg::SkimInitError), e)))
 }
 
 /// skimで選択された行からアクションを決定する
@@ -303,9 +454,15 @@ pub(super) fn determine_skim_action(
     source_sql: &str,
 ) -> SkimAction {
     if first_column == "Database" {
-        SkimAction::DrillDown(format!("USE {}", crate::query::escape_identifier(first_value)))
+        SkimAction::DrillDown(format!(
+            "USE {}",
+            crate::query::escape_identifier(first_value)
+        ))
     } else if first_column.starts_with("Tables_in_") {
-        SkimAction::DrillDown(format!("SELECT * FROM {}", crate::query::escape_identifier(first_value)))
+        SkimAction::DrillDown(format!(
+            "SELECT * FROM {}",
+            crate::query::escape_identifier(first_value)
+        ))
     } else {
         let record = SelectedRecord {
             columns: columns
@@ -316,24 +473,14 @@ pub(super) fn determine_skim_action(
         };
         // source_sqlからテーブル名を抽出してSELECT文のテンプレートを生成する
         // テーブル名が取得できない場合は "?" をフォールバックとして使う
-        // extract_from_table は "db.table" 形式（バッククォートなし）を返すため
-        // "." で分割して各部分を個別に escape_identifier に渡す
-        let table_raw = crate::completion::extract_from_table(source_sql).unwrap_or_else(|| "?".to_string());
-        let escaped_table = if let Some((db, tbl)) = table_raw.split_once('.') {
-            format!(
-                "{}.{}",
-                crate::query::escape_identifier(db),
-                crate::query::escape_identifier(tbl)
-            )
-        } else {
-            crate::query::escape_identifier(&table_raw)
-        };
+        let table_name =
+            crate::completion::extract_from_table(source_sql).unwrap_or_else(|| "?".to_string());
         // MySQLのエスケープルールに従い、バックスラッシュ→シングルクォートの順に処理する
         // 順序が重要: バックスラッシュを先にエスケープしないと、後のシングルクォートエスケープが壊れる
         let escaped_value = first_value.replace('\\', "\\\\").replace('\'', "\\'");
         let where_clause = format!(
             "SELECT * FROM {} WHERE {} = '{}'",
-            escaped_table,
+            crate::query::escape_identifier(&table_name),
             crate::query::escape_identifier(first_column),
             escaped_value
         );
@@ -342,6 +489,18 @@ pub(super) fn determine_skim_action(
             record,
         }
     }
+}
+
+/// SQL入力エリアとShell入力エリアのフォーカス状態
+///
+/// Tab キーで切り替え可能。Shell フォーカス時は補完ポップアップを表示しない。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(super) enum InputFocus {
+    /// SQL入力エリア（デフォルト）
+    #[default]
+    Sql,
+    /// Shell入力エリア
+    Shell,
 }
 
 /// 実行中クエリの管理情報
@@ -358,13 +517,6 @@ pub enum AppState {
     Selecting {
         connections: Vec<crate::config::ConnectionConfig>,
         selected_index: usize,
-    },
-
-    /// 接続処理中（バックグラウンドで接続を試みている間）
-    Connecting {
-        connection_name: String,
-        /// スピナーアニメーションのフレーム番号
-        spinner_frame: u8,
     },
 
     /// 接続済み（SQL入力待ち）
@@ -410,6 +562,103 @@ pub enum AppState {
     },
 }
 
+/// SQL入力エリアの状態管理
+pub(super) struct SqlInputState {
+    /// 入力中のSQLテキスト
+    pub text: String,
+    /// カーソル位置（char単位）
+    pub cursor_position: usize,
+    /// テキスト選択開始位置（char単位、None=選択なし）
+    ///
+    /// Shift+矢印キーで選択範囲を設定する。cursor_positionと組み合わせて
+    /// min(selection_start, cursor_position)..max(selection_start, cursor_position) が選択範囲となる。
+    pub selection_start: Option<usize>,
+    /// 最後に実行したSQL（WHEREテンプレート生成時にテーブル名を抽出するために保持）
+    ///
+    /// ShowingResult 遷移時に text がクリアされるため、
+    /// show_result_with_skim でテーブル名を参照できるよう別途保存する。
+    pub last_sql: String,
+    /// SQL実行履歴（最新が末尾）
+    ///
+    /// Enter実行時に追加し、直前と同じクエリは重複追加しない。
+    /// MAX_SQL_HISTORY を超えた場合は先頭（最古）を削除する。
+    /// 先頭削除がO(n)になるVecの代わりにVecDequeを使用する。
+    pub history: VecDeque<String>,
+    /// 履歴参照中の現在位置（None=新規入力中、Some(index)=履歴参照中）
+    pub history_index: Option<usize>,
+    /// 履歴参照を開始した時点で退避しておいた入力中テキスト
+    ///
+    /// ↓キーで履歴末尾を超えて新規入力状態に戻る際に復元する。
+    pub history_draft: String,
+    /// Ctrl+K / Ctrl+U で削除したテキストを保存するキルバッファ
+    ///
+    /// Ctrl+Y（yank）でペースト可能。システムクリップボードとは独立している。
+    pub kill_buffer: String,
+    /// 補完候補キャッシュ（接続確立後に非同期で充填）
+    ///
+    /// Arc<tokio::sync::RwLock<...>> でラップし、バックグラウンドタスクから
+    /// 書き込み、TUIの描画ループから読み取りを安全に行う。
+    pub completion_cache: Arc<tokio::sync::RwLock<CompletionCache>>,
+    /// 補完ポップアップ状態
+    ///
+    /// None = ポップアップ非表示、Some(...) = 候補リスト表示中
+    pub completion_state: Option<CompletionState>,
+}
+
+impl SqlInputState {
+    fn new() -> Self {
+        Self {
+            text: String::new(),
+            cursor_position: 0,
+            selection_start: None,
+            last_sql: String::new(),
+            history: VecDeque::new(),
+            history_index: None,
+            history_draft: String::new(),
+            kill_buffer: String::new(),
+            completion_cache: Arc::new(tokio::sync::RwLock::new(CompletionCache::new())),
+            completion_state: None,
+        }
+    }
+}
+
+/// Shell入力エリアの状態管理
+#[derive(Debug)]
+pub(super) struct ShellInputState {
+    /// 入力中のテキスト
+    pub text: String,
+    /// カーソル位置（char単位）
+    pub cursor_position: usize,
+    /// Shell実行履歴（最新が末尾）
+    ///
+    /// MAX_SQL_HISTORY と同じ上限を使用する。
+    pub history: VecDeque<String>,
+    /// Shell履歴参照中の現在位置（None=新規入力中、Some(index)=履歴参照中）
+    pub history_index: Option<usize>,
+    /// Shell履歴参照を開始した時点で退避しておいた入力中テキスト
+    ///
+    /// ↓キーで履歴末尾を超えて新規入力状態に戻る際に復元する。
+    pub history_draft: String,
+    /// 実行待ちのシェルコマンド
+    ///
+    /// handle_shell_input から直接 terminal を操作できないため、
+    /// run_loop が検出して TUI を一時停止しコマンドを実行する pending 方式を採用する。
+    pub pending_command: Option<String>,
+}
+
+impl ShellInputState {
+    fn new() -> Self {
+        Self {
+            text: String::new(),
+            cursor_position: 0,
+            history: VecDeque::new(),
+            history_index: None,
+            history_draft: String::new(),
+            pending_command: None,
+        }
+    }
+}
+
 /// 補完ポップアップの表示状態
 #[derive(Debug, Clone)]
 pub struct CompletionState {
@@ -426,9 +675,6 @@ pub struct App {
     /// 現在の状態
     pub(super) state: AppState,
 
-    /// 入力中のSQLクエリ（Connected状態で使用）
-    pub(super) query_input: String,
-
     /// 終了フラグ
     pub(super) should_quit: bool,
 
@@ -440,39 +686,6 @@ pub struct App {
 
     /// グレースフルシャットダウン用フラグ
     pub(super) shutdown_flag: Arc<AtomicBool>,
-
-    /// SQL入力欄のカーソル位置（char単位）
-    ///
-    /// query_inputはUTF-8文字列なので、バイト位置ではなくchar単位で管理する。
-    /// 描画時やBackspace/insert時にchar_indices()でバイト位置へ変換して使用する。
-    pub(super) cursor_position: usize,
-
-    /// SQL入力欄のテキスト選択開始位置（char単位、None=選択なし）
-    ///
-    /// Shift+矢印キーで選択範囲を設定する。cursor_positionと組み合わせて
-    /// min(selection_start, cursor_position)..max(selection_start, cursor_position) が選択範囲となる。
-    pub(super) selection_start: Option<usize>,
-
-    /// 最後に実行したSQLクエリ（WHEREテンプレート生成時にテーブル名を抽出するために保持）
-    ///
-    /// ShowingResult 遷移時に query_input がクリアされるため、
-    /// show_result_with_skim でテーブル名を参照できるよう別途保存する。
-    pub(super) last_sql: String,
-
-    /// SQL実行履歴（最新が末尾）
-    ///
-    /// Enter実行時に追加し、直前と同じクエリは重複追加しない。
-    /// MAX_SQL_HISTORY を超えた場合は先頭（最古）を削除する。
-    /// 先頭削除がO(n)になるVecの代わりにVecDequeを使用する。
-    pub(super) sql_history: VecDeque<String>,
-
-    /// 履歴参照中の現在位置（None=新規入力中、Some(index)=履歴参照中）
-    pub(super) history_index: Option<usize>,
-
-    /// 履歴参照を開始した時点で退避しておいた入力中テキスト
-    ///
-    /// ↓キーで履歴末尾を超えて新規入力状態に戻る際に復元する。
-    pub(super) history_draft: String,
 
     /// USEコマンドで選択中のデータベース名
     ///
@@ -486,6 +699,11 @@ pub struct App {
     /// 切断するまで変化しない。
     pub(super) connection_name: Option<String>,
 
+    /// bastion経由接続時のbastionホスト名（パンくずリスト表示用）
+    ///
+    /// bastion経由でない場合はNone。接続確立時に設定され、切断するまで変化しない。
+    pub(super) bastion_name: Option<String>,
+
     /// 現在操作中のテーブル名（パンくずリスト表示用）
     ///
     /// SELECT文実行時やCtrl+Sでテーブル選択時に更新される。
@@ -498,27 +716,16 @@ pub struct App {
     /// 接続設定の readonly=true との論理和で最終的な判定を行う。
     pub(super) readonly: bool,
 
-    /// Ctrl+K / Ctrl+U で削除したテキストを保存するキルバッファ
+    /// SQL/Shell 入力エリアのフォーカス状態
     ///
-    /// Ctrl+Y（yank）でペースト可能。システムクリップボードとは独立している。
-    pub(super) kill_buffer: String,
+    /// Tab キーで SQL ↔ Shell を切り替える。Shell フォーカス時は補完ポップアップを非表示にする。
+    pub(super) input_focus: InputFocus,
 
-    /// 補完候補キャッシュ（接続確立後に非同期で充填）
-    ///
-    /// Arc<tokio::sync::RwLock<...>> でラップし、バックグラウンドタスクから
-    /// 書き込み、TUIの描画ループから読み取りを安全に行う。
-    pub(super) completion_cache: Arc<tokio::sync::RwLock<CompletionCache>>,
+    /// SQL入力エリアの状態
+    pub(super) sql: SqlInputState,
 
-    /// 補完ポップアップ状態
-    ///
-    /// None = ポップアップ非表示、Some(...) = 候補リスト表示中
-    pub(super) completion_state: Option<CompletionState>,
-
-    /// 全接続設定リスト（Selecting状態復帰時に使用）
-    pub(super) connections: Vec<crate::config::ConnectionConfig>,
-
-    /// 接続中のバックグラウンドタスク（Ctrl+C で abort するために保持）
-    pub(super) connecting_task: Option<JoinHandle<crate::error::Result<ConnectionManager>>>,
+    /// Shell入力エリアの状態
+    pub(super) shell: ShellInputState,
 }
 
 impl App {
@@ -528,29 +735,21 @@ impl App {
         let connections = config.resolve_connections();
         Self {
             state: AppState::Selecting {
-                connections: connections.clone(),
+                connections,
                 selected_index: 0,
             },
-            query_input: String::new(),
             should_quit: false,
             running_query: None,
             selected_record: None,
             shutdown_flag,
-            cursor_position: 0,
-            selection_start: None,
-            last_sql: String::new(),
-            sql_history: VecDeque::new(),
-            history_index: None,
-            history_draft: String::new(),
             current_database: None,
             connection_name: None,
+            bastion_name: None,
             current_table: None,
             readonly: cli_readonly,
-            kill_buffer: String::new(),
-            completion_cache: Arc::new(tokio::sync::RwLock::new(CompletionCache::new())),
-            completion_state: None,
-            connections,
-            connecting_task: None,
+            input_focus: InputFocus::default(),
+            sql: SqlInputState::new(),
+            shell: ShellInputState::new(),
         }
     }
 
@@ -568,21 +767,36 @@ impl App {
             let readonly = self.readonly || selected_connection.readonly;
 
             // 接続名をパンくずリスト表示用に先に保存する（connect でムーブされるため）
-            let connection_name = selected_connection.name.clone();
-            self.connection_name = Some(connection_name.clone());
+            self.connection_name = Some(selected_connection.name.clone());
 
-            tracing::info!("Connecting to: {}", connection_name);
-
-            // 接続処理をバックグラウンドタスクに回してTUIループを先に起動し、接続中UIを表示できるようにする
-            self.connecting_task = Some(tokio::spawn(async move {
-                crate::connection::ConnectionManager::connect(selected_connection, readonly).await
-            }));
-
-            self.state = AppState::Connecting {
-                connection_name,
-                spinner_frame: 0,
+            // bastion経由の場合はbastionホスト名をパンくず表示用に保存する（connect でムーブされるため）
+            // resolve_connections() 後は BastionSetting::Config のみ存在する
+            self.bastion_name = match &selected_connection.bastion {
+                Some(crate::config::BastionSetting::Config(ref cfg)) => Some(cfg.host.clone()),
+                _ => None,
             };
 
+            // 接続を確立
+            tracing::info!("Connecting to: {}", selected_connection.name);
+            let manager =
+                crate::connection::ConnectionManager::connect(selected_connection, readonly)
+                    .await?;
+
+            // Connected状態に遷移
+            self.state = AppState::Connected { manager };
+
+            // バックグラウンドでキャッシュを初期化する（補完機能のためのSHOW TABLES/DATABASES）
+            // 失敗しても補完なしで動作継続するため、エラーはwarnログのみ
+            // 初回接続時は current_database は None なので None を渡す
+            if let AppState::Connected { ref manager } = self.state {
+                let cache_arc = self.sql.completion_cache.clone();
+                let pool = manager.pool().clone();
+                tokio::spawn(async move {
+                    if let Err(e) = initialize_completion_cache(&cache_arc, &pool, None).await {
+                        tracing::warn!("補完キャッシュの初期化に失敗しました: {}", e);
+                    }
+                });
+            }
         }
 
         // ターミナル初期化
@@ -606,12 +820,6 @@ impl App {
             .show_cursor()
             .map_err(|e| Error::Tui(format!("カーソル表示失敗: {}", e)))?;
 
-        // spawn_blocking 内の同期タスク（SSH/DNS）は abort() できないため、
-        // 接続中にキャンセルされた場合はプロセスを即終了してタイムアウト待ちを回避する
-        if self.connecting_task.is_some() {
-            std::process::exit(0);
-        }
-
         result
     }
 
@@ -622,7 +830,6 @@ impl App {
     ) -> Result<()> {
         loop {
             self.poll_query_completion().await?;
-            self.poll_connecting().await?;
 
             // StreamingQuery状態に遷移した場合、ストリーミングでskimに渡す
             if matches!(self.state, AppState::StreamingQuery { .. }) {
@@ -633,20 +840,27 @@ impl App {
                         selected_index: 0,
                     },
                 ) {
-                    AppState::StreamingQuery { manager, sql, timeout_secs } => (manager, sql, timeout_secs),
+                    AppState::StreamingQuery {
+                        manager,
+                        sql,
+                        timeout_secs,
+                    } => (manager, sql, timeout_secs),
                     other => {
                         self.state = other;
                         continue;
                     }
                 };
 
+                // TUI一時停止
+                disable_raw_mode().map_err(|e| Error::Tui(format!("ターミナル復元失敗: {}", e)))?;
+                execute!(terminal.backend_mut(), LeaveAlternateScreen)
+                    .map_err(|e| Error::Tui(format!("ターミナル復元失敗: {}", e)))?;
+
                 // ストリーミング表示（SQLエラー・タイムアウト時は?でErrを返してrun_loopに伝播）
-                // LeaveAlternateScreen は show_result_streaming 内でサンプリング完了後に行う（ちらつき防止）
                 let streaming_result = self.show_result_streaming(
                     manager.pool().clone(),
                     &sql,
                     std::time::Duration::from_secs(timeout_secs),
-                    terminal,
                 );
 
                 // TUI再開（ストリーミング結果に関わらず必ず再開する）
@@ -675,10 +889,10 @@ impl App {
                     Some(SkimAction::DrillDown(next_sql)) => {
                         self.state = AppState::Connected { manager };
                         self.selected_record = None;
-                        self.query_input = next_sql;
-                        self.cursor_position = self.query_input.chars().count();
-                        self.add_to_history(&self.query_input.clone());
-                        let sql_upper = self.query_input.trim().to_uppercase();
+                        self.sql.text = next_sql;
+                        self.sql.cursor_position = self.sql.text.chars().count();
+                        self.add_to_history(&self.sql.text.clone());
+                        let sql_upper = self.sql.text.trim().to_uppercase();
                         if sql_upper.starts_with("USE ") || sql_upper.starts_with("SET ") {
                             self.execute_query()?;
                         } else {
@@ -691,20 +905,15 @@ impl App {
                     }) => {
                         self.state = AppState::Connected { manager };
                         self.selected_record = Some(record);
-                        self.query_input = where_template;
-                        self.cursor_position = self.query_input.chars().count();
+                        self.sql.text = where_template;
+                        self.sql.cursor_position = self.sql.text.chars().count();
                     }
                     None => {
                         self.state = AppState::Connected { manager };
-                        self.query_input.clear();
-                        self.cursor_position = 0;
+                        self.sql.text.clear();
+                        self.sql.cursor_position = 0;
                     }
                 }
-
-                // 状態遷移直後に即描画してちらつきを抑制する
-                terminal
-                    .draw(|f| self.render(f))
-                    .map_err(|e| Error::Tui(format!("描画エラー: {}", e)))?;
 
                 continue;
             }
@@ -728,14 +937,17 @@ impl App {
                     }
                 };
 
+                // TUI一時停止
+                disable_raw_mode().map_err(|e| Error::Tui(format!("ターミナル復元失敗: {}", e)))?;
+                execute!(terminal.backend_mut(), LeaveAlternateScreen)
+                    .map_err(|e| Error::Tui(format!("ターミナル復元失敗: {}", e)))?;
+
                 // カラム選択（DBエラー時は Error 状態に遷移）
                 // current_database を渡して USE 後のDBのテーブル一覧を正しく表示する
-                // LeaveAlternateScreen は select_columns_interactive 内でデータ準備後に行う（ちらつき防止）
                 let select_result = self.select_columns_interactive(
                     manager.pool(),
                     std::time::Duration::from_secs(timeout_secs),
                     self.current_database.as_deref(),
-                    terminal,
                 );
 
                 // TUI再開（カラム選択結果に関わらず必ず再開する）
@@ -758,8 +970,8 @@ impl App {
                     Ok(Some(sql)) => {
                         // 生成されたSELECT文を即実行する
                         self.state = AppState::Connected { manager };
-                        self.query_input = sql;
-                        self.cursor_position = self.query_input.chars().count();
+                        self.sql.text = sql;
+                        self.sql.cursor_position = self.sql.text.chars().count();
                         self.execute_query()?;
                     }
                     Ok(None) => {
@@ -767,11 +979,6 @@ impl App {
                         self.state = AppState::Connected { manager };
                     }
                 }
-
-                // 状態遷移直後に即描画してちらつきを抑制する
-                terminal
-                    .draw(|f| self.render(f))
-                    .map_err(|e| Error::Tui(format!("描画エラー: {}", e)))?;
 
                 continue;
             }
@@ -793,8 +1000,13 @@ impl App {
                     }
                 };
 
-                // skimで結果表示（LeaveAlternateScreen は show_result_with_skim 内でデータ準備後に行う）
-                let next_query = self.show_result_with_skim(&result, terminal)?;
+                // ratatuiを一時停止
+                disable_raw_mode().map_err(|e| Error::Tui(format!("ターミナル復元失敗: {}", e)))?;
+                execute!(terminal.backend_mut(), LeaveAlternateScreen)
+                    .map_err(|e| Error::Tui(format!("ターミナル復元失敗: {}", e)))?;
+
+                // skimで結果表示
+                let next_query = self.show_result_with_skim(&result)?;
 
                 // ratatuiを再開
                 enable_raw_mode()
@@ -811,9 +1023,9 @@ impl App {
                         if let Some(manager) = manager_opt {
                             self.state = AppState::Connected { manager };
                             self.selected_record = None;
-                            self.query_input = sql;
-                            self.cursor_position = self.query_input.chars().count();
-                            self.add_to_history(&self.query_input.clone());
+                            self.sql.text = sql;
+                            self.sql.cursor_position = self.sql.text.chars().count();
+                            self.add_to_history(&self.sql.text.clone());
                             self.execute_query()?;
                         } else {
                             self.should_quit = true;
@@ -826,8 +1038,8 @@ impl App {
                         if let Some(manager) = manager_opt {
                             self.state = AppState::Connected { manager };
                             self.selected_record = Some(record);
-                            self.query_input = where_template;
-                            self.cursor_position = self.query_input.chars().count();
+                            self.sql.text = where_template;
+                            self.sql.cursor_position = self.sql.text.chars().count();
                         } else {
                             self.should_quit = true;
                         }
@@ -840,11 +1052,6 @@ impl App {
                         }
                     }
                 }
-
-                // 状態遷移直後に即描画してちらつきを抑制する
-                terminal
-                    .draw(|f| self.render(f))
-                    .map_err(|e| Error::Tui(format!("描画エラー: {}", e)))?;
 
                 continue;
             }
@@ -886,11 +1093,89 @@ impl App {
             // 終了チェック
             if self.should_quit {
                 self.abort_running_query();
-                // abort() のみ呼び take() しない（run() 側で is_some() を確認して process::exit するため）
-                if let Some(ref task) = self.connecting_task {
-                    task.abort();
-                }
                 break;
+            }
+
+            // pending_shell_command チェック: TUI を一時停止してシェルコマンドを実行する
+            // handle_shell_input は terminal への参照を持てないため、
+            // App フィールド経由でトリガーを通知し、run_loop 側で実際の停止・再起動を担う
+            if let Some(cmd) = self.shell.pending_command.take() {
+                use std::process::Stdio;
+
+                // bastion経由接続中の場合はbastionサーバー上でコマンドを実行する。
+                // resolve_connections()適用後のConfigではbastionはConfig(BastionConfig)かNoneのみなので
+                // Toggle(true/false)は考慮不要。
+                let bastion_config: Option<BastionConfig> = self
+                    .current_connection_config()
+                    .and_then(|config| match &config.bastion {
+                        Some(BastionSetting::Config(cfg)) => Some(cfg.clone()),
+                        _ => None,
+                    });
+
+                if bastion_config.is_some() {
+                    tracing::info!("Executing shell command on bastion server: {}", cmd);
+                } else {
+                    tracing::info!("Executing shell command locally: {}", cmd);
+                }
+
+                // TUI を一時停止
+                disable_raw_mode().map_err(|e| Error::Tui(format!("ターミナル復元失敗: {}", e)))?;
+                execute!(terminal.backend_mut(), LeaveAlternateScreen)
+                    .map_err(|e| Error::Tui(format!("ターミナル復元失敗: {}", e)))?;
+
+                let status = if let Some(ref bastion_cfg) = bastion_config {
+                    // bastion経由: ssh コマンド経由でリモート実行する
+                    let mut ssh_cmd = tokio::process::Command::new("ssh");
+                    ssh_cmd
+                        .arg("-p")
+                        .arg(bastion_cfg.port.to_string())
+                        .arg(format!("{}@{}", bastion_cfg.user, bastion_cfg.host));
+
+                    // key_pathが指定されている場合のみ -i オプションを付ける。
+                    // 指定がない場合は SSH agent に委ねる。
+                    if let Some(ref key_path) = bastion_cfg.key_path {
+                        ssh_cmd.arg("-i").arg(key_path);
+                    }
+
+                    ssh_cmd
+                        .arg(&cmd)
+                        .stdin(Stdio::inherit())
+                        .stdout(Stdio::inherit())
+                        .stderr(Stdio::inherit())
+                        .status()
+                        .await
+                        .map_err(|e| Error::Tui(format!("SSHコマンド実行失敗: {}", e)))?
+                } else {
+                    // 直接接続: sh -c でローカル実行する（標準 I/O を継承）
+                    tokio::process::Command::new("sh")
+                        .arg("-c")
+                        .arg(&cmd)
+                        .stdin(Stdio::inherit())
+                        .stdout(Stdio::inherit())
+                        .stderr(Stdio::inherit())
+                        .status()
+                        .await
+                        .map_err(|e| Error::Tui(format!("シェルコマンド実行失敗: {}", e)))?
+                };
+
+                if !status.success() {
+                    tracing::warn!("Shell command exited with status: {}", status);
+                }
+
+                // ユーザーが結果を確認できるよう Enter 入力まで待機
+                println!("\n[Press Enter to continue...]");
+                let _ = std::io::stdin().read_line(&mut String::new());
+
+                // TUI を再開
+                enable_raw_mode()
+                    .map_err(|e| Error::Tui(format!("ターミナル初期化失敗: {}", e)))?;
+                execute!(terminal.backend_mut(), EnterAlternateScreen)
+                    .map_err(|e| Error::Tui(format!("ターミナル初期化失敗: {}", e)))?;
+                terminal
+                    .clear()
+                    .map_err(|e| Error::Tui(format!("画面クリア失敗: {}", e)))?;
+
+                continue;
             }
 
             // イベント処理（100ms待機）
@@ -906,6 +1191,22 @@ impl App {
         Ok(())
     }
 
+    /// 現在接続中のConnectionConfigを取得する（bastion判定に使用）
+    ///
+    /// manager を保持しているすべての AppState からconfig参照を返す。
+    /// 接続していない状態（Selecting / Executing / Error 等）ではNoneを返す。
+    fn current_connection_config(&self) -> Option<&crate::config::ConnectionConfig> {
+        match &self.state {
+            AppState::Connected { manager } => Some(manager.config()),
+            AppState::StreamingQuery { manager, .. } => Some(manager.config()),
+            AppState::SelectingColumns { manager, .. } => Some(manager.config()),
+            AppState::ShowingResult {
+                manager: Some(manager),
+                ..
+            } => Some(manager.config()),
+            _ => None,
+        }
+    }
 
     /// 現在の接続がreadonlyモードかどうかを返す
     ///
@@ -939,7 +1240,7 @@ impl App {
             }
         };
 
-        let query = self.query_input.clone();
+        let query = self.sql.text.clone();
         let pool = manager.pool().clone();
         let query_for_task = query.clone();
         // プールのセッション状態問題を回避するため、現在のデータベースをキャプチャしておく。
@@ -947,7 +1248,7 @@ impl App {
         let current_database_for_task = self.current_database.clone();
 
         // 次の show_result_with_skim でテーブル名を抽出できるよう保存する
-        self.last_sql = query.clone();
+        self.sql.last_sql = query.clone();
 
         // 実行中状態に遷移
         self.state = AppState::Executing {
@@ -1004,7 +1305,9 @@ impl App {
         match task.await {
             Ok(Err(e)) => {
                 tracing::error!("Query execution failed: {}", e);
-                let error_message = t!(TuiMsg::QueryFailed { detail: &e.user_message() });
+                let error_message = t!(TuiMsg::QueryFailed {
+                    detail: &e.user_message()
+                });
                 let previous_state = Box::new(AppState::Connected { manager });
                 self.state = AppState::Error {
                     message: error_message,
@@ -1019,22 +1322,22 @@ impl App {
                         result,
                         manager: Some(manager),
                     };
-                    self.query_input.clear();
-                    self.cursor_position = 0;
+                    self.sql.text.clear();
+                    self.sql.cursor_position = 0;
                 } else {
                     // USE/SET等の結果を表示しないコマンドは即座にConnected状態に戻る
                     // USEコマンドの場合は選択データベースを更新する
                     self.update_current_database();
                     tracing::debug!("Command executed, returning to Connected state");
                     self.state = AppState::Connected { manager };
-                    self.query_input.clear();
-                    self.cursor_position = 0;
+                    self.sql.text.clear();
+                    self.sql.cursor_position = 0;
 
                     // USE実行後はテーブルキャッシュを更新する（新しいDBのテーブル一覧を取得）
                     // self.current_database は update_current_database() で更新済みのため、
                     // クローンして spawn に渡すことで正しいDBのテーブル一覧を取得できる
                     if let AppState::Connected { ref manager } = self.state {
-                        let cache_arc = self.completion_cache.clone();
+                        let cache_arc = self.sql.completion_cache.clone();
                         let pool = manager.pool().clone();
                         let current_db = self.current_database.clone();
                         tokio::spawn(async move {
@@ -1057,7 +1360,9 @@ impl App {
                 let error_message = if join_error.is_cancelled() {
                     t!(TuiMsg::QueryCancelled { query: &query })
                 } else {
-                    t!(TuiMsg::QueryTaskFailed { detail: &join_error.to_string() })
+                    t!(TuiMsg::QueryTaskFailed {
+                        detail: &join_error.to_string()
+                    })
                 };
                 let previous_state = Box::new(AppState::Connected { manager });
                 self.state = AppState::Error {
@@ -1069,71 +1374,73 @@ impl App {
         }
     }
 
-    /// 接続バックグラウンドタスクの完了をポーリングし、完了したら Connected または Error 状態に遷移する
-    async fn poll_connecting(&mut self) -> Result<()> {
-        if !matches!(self.state, AppState::Connecting { .. }) {
-            return Ok(());
+    /// Shell実行履歴に追加する
+    ///
+    /// 直前と同じコマンドは重複追加しない。最大MAX_SQL_HISTORY件を保持する。
+    pub(super) fn add_to_shell_history(&mut self, cmd: &str) {
+        let cmd = cmd.trim().to_string();
+        if cmd.is_empty() {
+            return;
         }
-
-        let finished = self
-            .connecting_task
-            .as_ref()
-            .is_some_and(|t| t.is_finished());
-
-        if !finished {
-            // 接続中はスピナーフレームを進める
-            if let AppState::Connecting { ref mut spinner_frame, .. } = self.state {
-                *spinner_frame = spinner_frame.wrapping_add(1);
-            }
-            return Ok(());
-        }
-
-        let Some(task) = self.connecting_task.take() else {
-            return Ok(());
-        };
-
-        let connection_name = match &self.state {
-            AppState::Connecting { connection_name, .. } => connection_name.clone(),
-            _ => return Ok(()),
-        };
-
-        let connections = self.connections.clone();
-
-        match task.await {
-            Ok(Ok(manager)) => {
-                tracing::info!("Connection established: {}", connection_name);
-                let cache_arc = self.completion_cache.clone();
-                let pool = manager.pool().clone();
-                tokio::spawn(async move {
-                    if let Err(e) = initialize_completion_cache(&cache_arc, &pool, None).await {
-                        tracing::warn!("補完キャッシュの初期化に失敗しました: {}", e);
-                    }
-                });
-                self.state = AppState::Connected { manager };
-            }
-            Ok(Err(e)) => {
-                tracing::error!("Connection failed: {}", e);
-                self.state = AppState::Error {
-                    message: e.user_message(),
-                    previous_state: Box::new(AppState::Selecting {
-                        connections,
-                        selected_index: 0,
-                    }),
-                };
-            }
-            Err(join_error) => {
-                tracing::error!("Connection task panicked: {}", join_error);
-                self.state = AppState::Error {
-                    message: format!("接続タスクが異常終了しました: {}", join_error),
-                    previous_state: Box::new(AppState::Selecting {
-                        connections,
-                        selected_index: 0,
-                    }),
-                };
+        if self.shell.history.back().map(|s| s.as_str()) != Some(&cmd) {
+            self.shell.history.push_back(cmd);
+            if self.shell.history.len() > MAX_SQL_HISTORY {
+                self.shell.history.pop_front();
             }
         }
+        // 履歴参照状態をリセット（実行後は新規入力状態に戻す）
+        self.shell.history_index = None;
+        self.shell.history_draft.clear();
+    }
 
-        Ok(())
+    /// Shell履歴を遡る（古い方向へ）
+    pub(super) fn shell_history_prev(&mut self) {
+        if self.shell.history.is_empty() {
+            return;
+        }
+        match self.shell.history_index {
+            None => {
+                // 新規入力中 → 現在の入力を退避して最新の履歴を表示
+                self.shell.history_draft = self.shell.text.clone();
+                let idx = self.shell.history.len() - 1;
+                self.shell.history_index = Some(idx);
+                self.shell.text = self.shell.history[idx].clone();
+            }
+            Some(idx) if idx > 0 => {
+                // 履歴参照中 → さらに古い履歴へ
+                let new_idx = idx - 1;
+                self.shell.history_index = Some(new_idx);
+                self.shell.text = self.shell.history[new_idx].clone();
+            }
+            _ => {
+                // 最古の履歴に到達済み → 何もしない
+                return;
+            }
+        }
+        self.shell.cursor_position = self.shell.text.chars().count();
+    }
+
+    /// Shell履歴を進む（新しい方向へ）
+    pub(super) fn shell_history_next(&mut self) {
+        match self.shell.history_index {
+            Some(idx) => {
+                if idx + 1 < self.shell.history.len() {
+                    // より新しい履歴へ
+                    let new_idx = idx + 1;
+                    self.shell.history_index = Some(new_idx);
+                    self.shell.text = self.shell.history[new_idx].clone();
+                } else {
+                    // 履歴の末尾を超えた → 退避した入力を復元して新規入力状態に戻す
+                    self.shell.history_index = None;
+                    self.shell.text = self.shell.history_draft.clone();
+                    self.shell.history_draft.clear();
+                }
+                self.shell.cursor_position = self.shell.text.chars().count();
+            }
+            None => {
+                // 新規入力中 → 何もしない
+            }
+        }
     }
 
     /// 実行中クエリがあれば中断する
@@ -1155,9 +1462,12 @@ async fn fetch_tables(
 ) -> std::result::Result<Vec<String>, sqlx::Error> {
     use sqlx::Row;
     let rows = if let Some(db) = database {
-        sqlx::query(&format!("SHOW TABLES FROM {}", crate::query::escape_identifier(db)))
-            .fetch_all(pool)
-            .await?
+        sqlx::query(&format!(
+            "SHOW TABLES FROM {}",
+            crate::query::escape_identifier(db)
+        ))
+        .fetch_all(pool)
+        .await?
     } else {
         sqlx::query("SHOW TABLES").fetch_all(pool).await?
     };
@@ -1223,10 +1533,7 @@ async fn refresh_table_cache(
     let mut cache_write = cache.write().await;
     cache_write.tables = tables;
 
-    tracing::debug!(
-        "Table cache refreshed: {} tables",
-        cache_write.tables.len()
-    );
+    tracing::debug!("Table cache refreshed: {} tables", cache_write.tables.len());
 
     Ok(())
 }
@@ -1242,7 +1549,7 @@ mod tests {
     use std::sync::atomic::AtomicBool;
     use std::sync::Arc;
 
-    /// テスト用に query_input のみをセットした最小限の App を生成する
+    /// テスト用に sql.text のみをセットした最小限の App を生成する
     ///
     /// App::new() は Config 等の複雑な依存があるため、テストでは
     /// 必要なフィールドのみをセットした App を直接構築する。
@@ -1252,29 +1559,205 @@ mod tests {
                 connections: Vec::new(),
                 selected_index: 0,
             },
-            query_input: input.to_string(),
             should_quit: false,
             running_query: None,
             selected_record: None,
             shutdown_flag: Arc::new(AtomicBool::new(false)),
-            cursor_position: 0,
-            selection_start: None,
-            last_sql: String::new(),
-            sql_history: std::collections::VecDeque::new(),
-            history_index: None,
-            history_draft: String::new(),
             current_database: None,
             connection_name: None,
+            bastion_name: None,
             current_table: None,
             readonly: false,
-            kill_buffer: String::new(),
-            completion_cache: Arc::new(tokio::sync::RwLock::new(
-                crate::completion::CompletionCache::new(),
-            )),
-            completion_state: None,
-            connections: Vec::new(),
-            connecting_task: None,
+            input_focus: InputFocus::default(),
+            sql: SqlInputState {
+                text: input.to_string(),
+                cursor_position: 0,
+                selection_start: None,
+                last_sql: String::new(),
+                history: std::collections::VecDeque::new(),
+                history_index: None,
+                history_draft: String::new(),
+                kill_buffer: String::new(),
+                completion_cache: Arc::new(tokio::sync::RwLock::new(
+                    crate::completion::CompletionCache::new(),
+                )),
+                completion_state: None,
+            },
+            shell: ShellInputState {
+                text: String::new(),
+                cursor_position: 0,
+                history: std::collections::VecDeque::new(),
+                history_index: None,
+                history_draft: String::new(),
+                pending_command: None,
+            },
         }
+    }
+
+    // ============================================================
+    // タスク 10-12: InputFocus のデフォルト値と Shell 履歴のユニットテスト
+    // ============================================================
+
+    #[test]
+    fn test_input_focus_default() {
+        assert_eq!(InputFocus::default(), InputFocus::Sql);
+    }
+
+    #[test]
+    fn test_shell_history_add_dedup() {
+        let mut app = make_app_with_input("");
+        app.add_to_shell_history("ls -la");
+        app.add_to_shell_history("ls -la"); // 重複
+        assert_eq!(app.shell.history.len(), 1);
+    }
+
+    #[test]
+    fn test_shell_history_limit() {
+        let mut app = make_app_with_input("");
+        // MAX_SQL_HISTORY + 1 件追加すると最古が削除される
+        for i in 0..=MAX_SQL_HISTORY {
+            app.add_to_shell_history(&format!("cmd_{}", i));
+        }
+        assert_eq!(app.shell.history.len(), MAX_SQL_HISTORY);
+        // 最古の "cmd_0" が削除されて "cmd_1" が先頭になるはず
+        assert_eq!(app.shell.history.front().map(|s| s.as_str()), Some("cmd_1"));
+    }
+
+    #[test]
+    fn test_shell_history_prev_next() {
+        let mut app = make_app_with_input("");
+        app.add_to_shell_history("echo hello");
+        app.add_to_shell_history("ls");
+
+        // ↑ で最新の "ls" を表示
+        app.shell_history_prev();
+        assert_eq!(app.shell.text, "ls");
+        assert_eq!(app.shell.history_index, Some(1));
+
+        // ↑ でさらに古い "echo hello" を表示
+        app.shell_history_prev();
+        assert_eq!(app.shell.text, "echo hello");
+        assert_eq!(app.shell.history_index, Some(0));
+
+        // ↓ で "ls" に戻る
+        app.shell_history_next();
+        assert_eq!(app.shell.text, "ls");
+        assert_eq!(app.shell.history_index, Some(1));
+    }
+
+    #[test]
+    fn test_shell_history_draft_restore() {
+        let mut app = make_app_with_input("");
+        app.shell.text = "draft text".to_string();
+        app.add_to_shell_history("echo hello");
+
+        // ↑ で履歴参照開始（draft は "draft text" として退避）
+        app.shell_history_prev();
+        assert_eq!(app.shell.text, "echo hello");
+        assert_eq!(app.shell.history_draft, "draft text");
+
+        // ↓ で末尾を超えると draft が復元される
+        app.shell_history_next();
+        assert_eq!(app.shell.text, "draft text");
+        assert_eq!(app.shell.history_index, None);
+    }
+
+    // ============================================================
+    // タスク 10-13: Tab フォーカス切り替えと Shell 入力のユニットテスト
+    // ============================================================
+
+    #[tokio::test]
+    async fn test_tab_switches_focus_sql_to_shell() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+        let mut app = make_app_with_input("");
+        app.input_focus = InputFocus::Sql;
+
+        let tab_event = KeyEvent {
+            code: KeyCode::Tab,
+            modifiers: KeyModifiers::NONE,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        };
+        app.handle_connected_input(tab_event).await.unwrap();
+        assert_eq!(app.input_focus, InputFocus::Shell);
+    }
+
+    #[tokio::test]
+    async fn test_tab_switches_focus_shell_to_sql() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+        let mut app = make_app_with_input("");
+        app.input_focus = InputFocus::Shell;
+
+        let tab_event = KeyEvent {
+            code: KeyCode::Tab,
+            modifiers: KeyModifiers::NONE,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        };
+        app.handle_connected_input(tab_event).await.unwrap();
+        assert_eq!(app.input_focus, InputFocus::Sql);
+    }
+
+    #[tokio::test]
+    async fn test_tab_does_not_switch_focus_when_completion_visible() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+        let mut app = make_app_with_input("");
+        app.input_focus = InputFocus::Sql;
+        // 補完ポップアップを表示状態にする
+        app.sql.completion_state = Some(CompletionState {
+            candidates: vec![crate::completion::CompletionItem {
+                text: "SELECT".to_string(),
+                kind: crate::completion::CompletionKind::Keyword,
+            }],
+            selected_index: 0,
+            current_token: "S".to_string(),
+        });
+
+        let tab_event = KeyEvent {
+            code: KeyCode::Tab,
+            modifiers: KeyModifiers::NONE,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        };
+        app.handle_connected_input(tab_event).await.unwrap();
+        // 補完中は Tab でフォーカスが切り替わらない（補完が1つ進むだけ）
+        assert_eq!(app.input_focus, InputFocus::Sql);
+    }
+
+    #[tokio::test]
+    async fn test_shell_input_char_insert() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+        let mut app = make_app_with_input("");
+        app.input_focus = InputFocus::Shell;
+
+        let char_event = KeyEvent {
+            code: KeyCode::Char('l'),
+            modifiers: KeyModifiers::NONE,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        };
+        app.handle_connected_input(char_event).await.unwrap();
+        assert_eq!(app.shell.text, "l");
+        assert_eq!(app.shell.cursor_position, 1);
+    }
+
+    #[tokio::test]
+    async fn test_shell_input_backspace() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+        let mut app = make_app_with_input("");
+        app.input_focus = InputFocus::Shell;
+        app.shell.text = "ls".to_string();
+        app.shell.cursor_position = 2;
+
+        let backspace_event = KeyEvent {
+            code: KeyCode::Backspace,
+            modifiers: KeyModifiers::NONE,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        };
+        app.handle_connected_input(backspace_event).await.unwrap();
+        assert_eq!(app.shell.text, "l");
+        assert_eq!(app.shell.cursor_position, 1);
     }
 
     // is_completion_separator のテスト
@@ -1389,7 +1872,7 @@ mod tests {
     fn test_word_right_from_end() {
         let app = make_app_with_input("SELECT");
         let len = "SELECT".chars().count(); // 6
-        // 末尾からの word_right は末尾のまま
+                                            // 末尾からの word_right は末尾のまま
         assert_eq!(app.word_right(len), len);
     }
 
@@ -1418,5 +1901,265 @@ mod tests {
         assert_eq!(app.word_right(0), 1);
         // (1) → 1,2,3,4,5 は区切り文字 → b(6) を進む → 7
         assert_eq!(app.word_right(1), 7);
+    }
+
+    // ============================================================
+    // is_write_sql / first_meaningful_token のユニットテスト
+    // ============================================================
+
+    #[test]
+    fn test_is_write_sql_with_comments() {
+        // ブロックコメント付きINSERT
+        assert!(is_write_sql("/* comment */ INSERT INTO users VALUES (1)"));
+        // 行コメント付きDELETE
+        assert!(is_write_sql("-- delete old data\nDELETE FROM users"));
+        // 複数コメント付きUPDATE
+        assert!(is_write_sql("/* a */ -- b\nUPDATE users SET name = 'x'"));
+        // コメント付きSELECTはfalse
+        assert!(!is_write_sql("/* hint */ SELECT * FROM users"));
+        // コメントのみ
+        assert!(!is_write_sql("/* only comment */"));
+    }
+
+    #[test]
+    fn test_is_write_sql_basic() {
+        // コメントなし通常ケースで既存の動作が維持されること
+        assert!(is_write_sql("INSERT INTO users VALUES (1)"));
+        assert!(is_write_sql("UPDATE users SET name = 'x'"));
+        assert!(is_write_sql("DELETE FROM users"));
+        assert!(is_write_sql("DROP TABLE users"));
+        assert!(is_write_sql("ALTER TABLE users ADD COLUMN age INT"));
+        assert!(is_write_sql("TRUNCATE TABLE users"));
+        assert!(is_write_sql("CREATE TABLE foo (id INT)"));
+        assert!(is_write_sql("REPLACE INTO users VALUES (1)"));
+        assert!(is_write_sql("RENAME TABLE a TO b"));
+        assert!(is_write_sql("GRANT ALL ON db.* TO 'user'@'%'"));
+        assert!(is_write_sql("REVOKE ALL ON db.* FROM 'user'@'%'"));
+        // 読み取り系はfalse
+        assert!(!is_write_sql("SELECT * FROM users"));
+        assert!(!is_write_sql("SHOW TABLES"));
+        assert!(!is_write_sql("USE mydb"));
+        // 大文字小文字混在
+        assert!(is_write_sql("insert into users values (1)"));
+        assert!(is_write_sql("Insert Into users values (1)"));
+    }
+
+    #[test]
+    fn test_first_meaningful_token_edge_cases() {
+        // 空文字列
+        assert_eq!(first_meaningful_token(""), "");
+        // 空白のみ
+        assert_eq!(first_meaningful_token("   "), "");
+        // 閉じないブロックコメント
+        assert_eq!(first_meaningful_token("/* unclosed"), "");
+        // 改行のない行コメント（ファイル末尾）
+        assert_eq!(first_meaningful_token("-- trailing comment"), "");
+        // ネストしないブロックコメント後にトークン
+        assert_eq!(first_meaningful_token("/* c1 */ /* c2 */ SELECT"), "SELECT");
+    }
+
+    #[test]
+    fn test_is_write_sql_with_semicolons() {
+        // セミコロン付きSQL
+        assert!(is_write_sql("DELETE FROM users;"));
+        assert!(is_write_sql("INSERT INTO users VALUES (1);"));
+        assert!(!is_write_sql("SELECT * FROM users;"));
+    }
+
+    #[test]
+    fn test_is_write_sql_cte_prefixed() {
+        // CTE + SELECT（読み取り）
+        assert!(!is_write_sql("WITH cte AS (SELECT 1) SELECT * FROM cte"));
+        // CTE + DELETE（書き込み）
+        assert!(is_write_sql("WITH old AS (SELECT id FROM users WHERE age > 100) DELETE FROM users WHERE id IN (SELECT id FROM old)"));
+        // CTE + INSERT（書き込み）
+        assert!(is_write_sql(
+            "WITH src AS (SELECT * FROM temp) INSERT INTO users SELECT * FROM src"
+        ));
+        // CTE + UPDATE（書き込み）
+        assert!(is_write_sql("WITH targets AS (SELECT id FROM users) UPDATE users SET active = 0 WHERE id IN (SELECT id FROM targets)"));
+        // 小文字CTE + 書き込み
+        assert!(is_write_sql("with cte as (select 1) delete from users"));
+        // 小文字CTE + 読み取り
+        assert!(!is_write_sql("with cte as (select 1) select * from cte"));
+    }
+
+    #[test]
+    fn test_is_write_sql_lowercase_and_mixed_case() {
+        assert!(is_write_sql("insert into users values (1)"));
+        assert!(is_write_sql("dElEtE FROM users"));
+        assert!(is_write_sql("  update users set x = 1"));
+        assert!(!is_write_sql("select 1"));
+        assert!(!is_write_sql("  show tables"));
+    }
+
+    // ============================================================
+    // update_current_database のユニットテスト
+    // ============================================================
+
+    #[test]
+    fn test_update_current_database_backtick_with_semicolon() {
+        // バグ修正の検証: `foo`; のセミコロン除去後にバッククォートが残らないこと
+        let mut app = make_app_with_input("");
+        app.sql.last_sql = "USE `foo`;".to_string();
+        app.update_current_database();
+        assert_eq!(app.current_database, Some("foo".to_string()));
+    }
+
+    #[test]
+    fn test_update_current_database_no_backtick() {
+        // バッククォートなし・セミコロンなし
+        let mut app = make_app_with_input("");
+        app.sql.last_sql = "USE mydb".to_string();
+        app.update_current_database();
+        assert_eq!(app.current_database, Some("mydb".to_string()));
+    }
+
+    #[test]
+    fn test_update_current_database_with_semicolon_no_backtick() {
+        // バッククォートなし・セミコロンあり
+        let mut app = make_app_with_input("");
+        app.sql.last_sql = "USE mydb;".to_string();
+        app.update_current_database();
+        assert_eq!(app.current_database, Some("mydb".to_string()));
+    }
+
+    #[test]
+    fn test_update_current_database_backtick_no_semicolon() {
+        // バッククォートあり・セミコロンなし（ハイフン等を含むDB名）
+        let mut app = make_app_with_input("");
+        app.sql.last_sql = "USE `my-db`".to_string();
+        app.update_current_database();
+        assert_eq!(app.current_database, Some("my-db".to_string()));
+    }
+
+    // ============================================================
+    // read_row_from_chunk のユニットテスト
+    // ============================================================
+
+    /// チャンクファイルに1行書き込んで read_row_from_chunk で正しく読み出せることを確認する
+    #[test]
+    fn test_read_row_from_chunk_single_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let columns = vec!["id".to_string(), "name".to_string(), "value".to_string()];
+        let data = vec!["1".to_string(), "Alice".to_string(), "100".to_string()];
+
+        // append_preview_to_chunk でチャンクバッファに書き込む
+        let mut chunk_buf = String::new();
+        append_preview_to_chunk(dir.path(), 0, &columns, &data, &mut chunk_buf);
+        // PREVIEW_CHUNK_SIZE 未満なのでバッファのまま、手動で flush する
+        flush_preview_chunk(dir.path(), 0, &chunk_buf);
+
+        let result = read_row_from_chunk(dir.path(), 0, &columns).unwrap();
+        assert_eq!(result, data);
+    }
+
+    /// 複数行を書き込んで任意の行を正しく読み出せることを確認する
+    #[test]
+    fn test_read_row_from_chunk_multiple_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let columns = vec!["col1".to_string(), "col2".to_string()];
+
+        let rows: Vec<Vec<String>> = (0..5)
+            .map(|i| vec![format!("val1_{}", i), format!("val2_{}", i)])
+            .collect();
+
+        let mut chunk_buf = String::new();
+        for (i, row) in rows.iter().enumerate() {
+            append_preview_to_chunk(dir.path(), i, &columns, row, &mut chunk_buf);
+        }
+        flush_preview_chunk(dir.path(), rows.len() - 1, &chunk_buf);
+
+        // 先頭行・中間行・末尾行を正しく読み出せること
+        assert_eq!(
+            read_row_from_chunk(dir.path(), 0, &columns).unwrap(),
+            rows[0]
+        );
+        assert_eq!(
+            read_row_from_chunk(dir.path(), 2, &columns).unwrap(),
+            rows[2]
+        );
+        assert_eq!(
+            read_row_from_chunk(dir.path(), 4, &columns).unwrap(),
+            rows[4]
+        );
+    }
+
+    /// PREVIEW_CHUNK_SIZE 境界をまたぐ行のアクセスが正しく動作することを確認する
+    #[test]
+    fn test_read_row_from_chunk_across_chunk_boundary() {
+        let dir = tempfile::tempdir().unwrap();
+        let columns = vec!["id".to_string()];
+        let total_rows = PREVIEW_CHUNK_SIZE + 3;
+
+        let mut chunk_buf = String::new();
+        for i in 0..total_rows {
+            let data = vec![i.to_string()];
+            append_preview_to_chunk(dir.path(), i, &columns, &data, &mut chunk_buf);
+        }
+        flush_preview_chunk(dir.path(), total_rows - 1, &chunk_buf);
+
+        // チャンク0の最後の行
+        let last_in_chunk0 = PREVIEW_CHUNK_SIZE - 1;
+        let result0 = read_row_from_chunk(dir.path(), last_in_chunk0, &columns).unwrap();
+        assert_eq!(result0, vec![last_in_chunk0.to_string()]);
+
+        // チャンク1の最初の行
+        let first_in_chunk1 = PREVIEW_CHUNK_SIZE;
+        let result1 = read_row_from_chunk(dir.path(), first_in_chunk1, &columns).unwrap();
+        assert_eq!(result1, vec![first_in_chunk1.to_string()]);
+
+        // チャンク1の3行目
+        let third_in_chunk1 = PREVIEW_CHUNK_SIZE + 2;
+        let result2 = read_row_from_chunk(dir.path(), third_in_chunk1, &columns).unwrap();
+        assert_eq!(result2, vec![third_in_chunk1.to_string()]);
+    }
+
+    /// カラム名に ": " が含まれる場合でもフォールバックで値を取得できることを確認する
+    #[test]
+    fn test_read_row_from_chunk_column_with_colon() {
+        let dir = tempfile::tempdir().unwrap();
+        // カラム名にコロンを含む場合: フォールバックロジックを使う
+        let columns = vec!["col:name".to_string(), "normal".to_string()];
+        let data = vec!["value1".to_string(), "value2".to_string()];
+
+        let mut chunk_buf = String::new();
+        append_preview_to_chunk(dir.path(), 0, &columns, &data, &mut chunk_buf);
+        flush_preview_chunk(dir.path(), 0, &chunk_buf);
+
+        let result = read_row_from_chunk(dir.path(), 0, &columns).unwrap();
+        // フォールバック: ": " の最初の位置で分割するため "value1" が取得できる
+        assert_eq!(result[0], "value1");
+        assert_eq!(result[1], "value2");
+    }
+
+    /// 存在しないチャンクファイルへのアクセスはエラーを返すことを確認する
+    #[test]
+    fn test_read_row_from_chunk_missing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let columns = vec!["id".to_string()];
+
+        let result = read_row_from_chunk(dir.path(), 0, &columns);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("チャンクファイルの読み込みに失敗しました"));
+    }
+
+    /// 存在する行インデックスを超えた場合はエラーを返すことを確認する
+    #[test]
+    fn test_read_row_from_chunk_out_of_bounds() {
+        let dir = tempfile::tempdir().unwrap();
+        let columns = vec!["id".to_string()];
+        let data = vec!["1".to_string()];
+
+        let mut chunk_buf = String::new();
+        append_preview_to_chunk(dir.path(), 0, &columns, &data, &mut chunk_buf);
+        flush_preview_chunk(dir.path(), 0, &chunk_buf);
+
+        // 同じチャンク内の存在しない行（インデックス1）を読み出そうとするとエラー
+        let result = read_row_from_chunk(dir.path(), 1, &columns);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("選択された行がチャンクファイル内に見つかりません"));
     }
 }

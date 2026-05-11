@@ -33,11 +33,8 @@ pub(crate) fn convert_value_to_string(
         // 型名に応じて適切に変換し、制御文字をサニタイズして返す
         // skimは1行=1アイテムのため、改行等が含まれるとUI崩れの原因になる
         let raw = match type_name {
-            "TINYINT" | "TINYINT UNSIGNED"
-            | "SMALLINT" | "SMALLINT UNSIGNED"
-            | "MEDIUMINT" | "MEDIUMINT UNSIGNED"
-            | "INT" | "INT UNSIGNED"
-            | "BIGINT" | "BIGINT UNSIGNED" => {
+            "TINYINT" | "TINYINT UNSIGNED" | "SMALLINT" | "SMALLINT UNSIGNED" | "MEDIUMINT"
+            | "MEDIUMINT UNSIGNED" | "INT" | "INT UNSIGNED" | "BIGINT" | "BIGINT UNSIGNED" => {
                 // 整数型（UNSIGNED含む）
                 // UNSIGNEDでも i64 で十分な範囲（BIGINT UNSIGNED の最大値は u64 だが大半は収まる）
                 row.try_get::<i64, _>(index)
@@ -45,7 +42,8 @@ pub(crate) fn convert_value_to_string(
                     .or_else(|_| row.try_get::<u64, _>(index).map(|v| v.to_string()))
                     .unwrap_or_else(|_| String::from("NULL"))
             }
-            "FLOAT" | "DOUBLE" | "DECIMAL" | "FLOAT UNSIGNED" | "DOUBLE UNSIGNED" | "DECIMAL UNSIGNED" => {
+            "FLOAT" | "DOUBLE" | "DECIMAL" | "FLOAT UNSIGNED" | "DOUBLE UNSIGNED"
+            | "DECIMAL UNSIGNED" => {
                 // 浮動小数点型（UNSIGNED含む）
                 row.try_get::<f64, _>(index)
                     .map(|v| v.to_string())
@@ -221,9 +219,8 @@ pub async fn execute_query(
     // Pin<Box<...>> で型を統一して後続処理を1つにまとめる
     let mut stream: std::pin::Pin<
         Box<
-            dyn futures::Stream<
-                    Item = std::result::Result<sqlx::mysql::MySqlRow, sqlx::Error>,
-                > + Send,
+            dyn futures::Stream<Item = std::result::Result<sqlx::mysql::MySqlRow, sqlx::Error>>
+                + Send,
         >,
     > = if let Some(ref mut conn) = conn_opt {
         Box::pin(sqlx::query(sql).fetch(&mut **conn))
@@ -264,9 +261,21 @@ pub async fn execute_query(
         }
     }
 
+    // streamはconn_optへの可変借用を保持しているため、describeで再借用する前に
+    // 明示的にdropしてボローチェッカーの制約を解除する
+    drop(stream);
+
     // 0件結果でも列ヘッダーを表示できるよう、必要時のみメタデータを補完する
+    // 専用コネクション(conn_opt)が存在する場合はそちらを使い、USEで切り替えた
+    // セッション状態を維持する。プールから別のコネクションを取得すると
+    // USE実行前のDBに対して describe が実行されてしまう。
     if data_rows.is_empty() && columns.is_empty() {
-        match pool.describe(sql).await {
+        let describe_result = if let Some(ref mut conn) = conn_opt {
+            (&mut **conn).describe(sql).await
+        } else {
+            pool.describe(sql).await
+        };
+        match describe_result {
             Ok(describe) => {
                 columns = describe
                     .columns()
@@ -304,6 +313,10 @@ pub async fn execute_query(
     Ok(result)
 }
 
+/// クエリ実行（タイムアウト付き）
+///
+/// `current_database` が指定されている場合、専用コネクションで USE を先行実行してからクエリを実行する。
+/// execute_query と同様の理由による。
 pub async fn execute_query_with_timeout(
     pool: &Pool<MySql>,
     sql: &str,

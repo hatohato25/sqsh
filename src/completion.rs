@@ -125,9 +125,25 @@ pub const SQL_KEYWORDS: &[&str] = &[
 pub fn is_completion_separator(c: char) -> bool {
     matches!(
         c,
-        ' ' | '\t' | ',' | ';' | '.' | '(' | ')' | '[' | ']'
-            | '=' | '<' | '>' | '!' | '+' | '-' | '*' | '/'
-            | '`' | '\'' | '"'
+        ' ' | '\t'
+            | ','
+            | ';'
+            | '.'
+            | '('
+            | ')'
+            | '['
+            | ']'
+            | '='
+            | '<'
+            | '>'
+            | '!'
+            | '+'
+            | '-'
+            | '*'
+            | '/'
+            | '`'
+            | '\''
+            | '"'
     )
 }
 
@@ -201,16 +217,15 @@ pub fn extract_from_table(sql: &str) -> Option<String> {
     let upper = sql.to_uppercase();
     let from_pos = upper.find(" FROM ")?;
     let after_from = sql[from_pos + 6..].trim_start();
-    // スペース・セミコロン・WHEREまでの最初のトークンを取得し、バッククォートを全て除去する
-    // `db`.`table` 形式で返ってきた場合でも生の "db.table" 文字列として返す
-    let raw = after_from
+    // バッククォートを除去しつつ最初の単語を取得
+    let table = after_from
         .split(|c: char| c.is_whitespace() || c == ';')
         .next()?
-        .replace('`', "");
-    if raw.is_empty() {
+        .trim_matches('`');
+    if table.is_empty() {
         None
     } else {
-        Some(raw)
+        Some(table.to_string())
     }
 }
 
@@ -345,17 +360,15 @@ pub fn get_candidates(
             );
             candidates
         }
-        SqlContext::DatabaseName => {
-            cache
-                .databases
-                .iter()
-                .filter(|d| d.to_lowercase().starts_with(&input_prefix.to_lowercase()))
-                .map(|d| CompletionItem {
-                    text: d.clone(),
-                    kind: CompletionKind::Database,
-                })
-                .collect()
-        }
+        SqlContext::DatabaseName => cache
+            .databases
+            .iter()
+            .filter(|d| d.to_lowercase().starts_with(&input_prefix.to_lowercase()))
+            .map(|d| CompletionItem {
+                text: d.clone(),
+                kind: CompletionKind::Database,
+            })
+            .collect(),
         SqlContext::DatabaseTableName { ref database } => {
             let db_tables = cache.database_tables.get(&database.to_lowercase());
             match db_tables {
@@ -388,7 +401,10 @@ pub async fn fetch_column_cache_if_needed(
             return;
         }
     }
-    let sql = format!("SHOW COLUMNS FROM {}", crate::query::escape_identifier(table_name));
+    let sql = format!(
+        "SHOW COLUMNS FROM {}",
+        crate::query::escape_identifier(table_name)
+    );
     if let Ok(rows) = sqlx::query(&sql).fetch_all(pool).await {
         use sqlx::Row;
         let columns: Vec<String> = rows
@@ -396,7 +412,9 @@ pub async fn fetch_column_cache_if_needed(
             .map(|row| row.try_get::<String, _>(0).unwrap_or_default())
             .collect();
         let mut cache_write = cache.write().await;
-        cache_write.columns.insert(table_name.to_lowercase(), columns);
+        cache_write
+            .columns
+            .insert(table_name.to_lowercase(), columns);
     }
 }
 
@@ -419,7 +437,10 @@ pub async fn fetch_database_tables_if_needed(
             return;
         }
     }
-    let sql = format!("SHOW TABLES FROM {}", crate::query::escape_identifier(database_name));
+    let sql = format!(
+        "SHOW TABLES FROM {}",
+        crate::query::escape_identifier(database_name)
+    );
     if let Ok(rows) = sqlx::query(&sql).fetch_all(pool).await {
         use sqlx::Row;
         let tables: Vec<String> = rows
@@ -485,10 +506,7 @@ mod tests {
     fn test_analyze_context_select_before_from() {
         // SELECT〜FROMの間はカラム名文脈
         let context = analyze_context("SELECT ");
-        assert_eq!(
-            context,
-            SqlContext::ColumnName { table: None }
-        );
+        assert_eq!(context, SqlContext::ColumnName { table: None });
     }
 
     // current_token_with_pos のテスト

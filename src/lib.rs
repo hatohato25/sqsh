@@ -3,6 +3,7 @@ pub mod config;
 pub mod connection;
 pub mod error;
 pub mod i18n;
+pub mod perf;
 pub mod query;
 pub mod selector;
 pub mod tui;
