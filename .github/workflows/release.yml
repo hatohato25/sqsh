@@ -78,41 +78,14 @@ jobs:
 
       - name: Update Formula
         run: |
-          # Formulaのversion・sha256をpython3で確実に書き換える
-          # Formulaの構造は固定（on_arm が先、on_intel が後）のため出現順で区別する
-          python3 - <<'PYEOF'
-          import os, re
-
-          formula_path = "Formula/sqsh.rb"
-          version     = os.environ["VERSION"]
-          aarch64_sha = os.environ["AARCH64_SHA256"]
-          x86_64_sha  = os.environ["X86_64_SHA256"]
-
-          with open(formula_path, "r") as f:
-              content = f.read()
-
-          # version行を置換
-          content = re.sub(r'version "[^"]*"', f'version "{version}"', content)
-
-          # sha256を出現順（1番目=aarch64、2番目=x86_64）に置換
-          sha_pattern = re.compile(r'(sha256 ")[a-f0-9]+(")')
-          count = 0
-          def replace_sha(m):
-              nonlocal count
-              count += 1
-              if count == 1:
-                  return f'{m.group(1)}{aarch64_sha}{m.group(2)}'
-              elif count == 2:
-                  return f'{m.group(1)}{x86_64_sha}{m.group(2)}'
-              return m.group(0)
-
-          content = sha_pattern.sub(replace_sha, content)
-
-          with open(formula_path, "w") as f:
-              f.write(content)
-
-          print(f"Updated: version={version}, aarch64={aarch64_sha}, x86_64={x86_64_sha}")
-          PYEOF
+          sed -i "s/version \".*\"/version \"${VERSION}\"/" Formula/sqsh.rb
+          # 1番目のsha256（aarch64）を置換後、2番目（x86_64）を置換
+          # 各sha256は1度しか現れないため、aarch64置換後にx86_64を置換する
+          FIRST_SHA=$(grep -m1 'sha256 "[a-f0-9]*"' Formula/sqsh.rb | grep -o '"[a-f0-9]*"' | tr -d '"')
+          SECOND_SHA=$(grep 'sha256 "[a-f0-9]*"' Formula/sqsh.rb | tail -1 | grep -o '"[a-f0-9]*"' | tr -d '"')
+          sed -i "s/sha256 \"${FIRST_SHA}\"/sha256 \"${AARCH64_SHA256}\"/" Formula/sqsh.rb
+          sed -i "s/sha256 \"${SECOND_SHA}\"/sha256 \"${X86_64_SHA256}\"/" Formula/sqsh.rb
+          echo "Updated: version=${VERSION}, aarch64=${AARCH64_SHA256}, x86_64=${X86_64_SHA256}"
 
       - name: Commit and push
         run: |
