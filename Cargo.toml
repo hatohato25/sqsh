@@ -51,7 +51,9 @@ arboard = "3"
 shellexpand = "3"
 
 # SSH tunneling (bastion support)
-ssh2 = "0.9"
+# vendored-openssl: システムのOpenSSLに依存せずビルド時にソースからOpenSSLをコンパイルするため、
+# macOSやCI環境でのOpenSSLパス問題を回避できる
+ssh2 = { version = "0.9", features = ["vendored-openssl"] }
 
 [dev-dependencies]
 mockall = "0.13"
