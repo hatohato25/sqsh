@@ -2,7 +2,7 @@
 
 A TUI MySQL client for fast database exploration with fuzzy search, written in Rust.
 
-![demo](https://github.com/hatohato25/sqsh/releases/download/v0.1.0/t-rec.gif)
+![demo](https://github.com/hatohato25/sqsh/releases/download/v0.2.0/t-rec.gif)
 
 ## Features
 
