@@ -224,14 +224,15 @@ impl App {
             }
             // Shift+Left: 選択しながら左へ移動
             // 通常のLeftより前に配置してShift修飾子付きが先にマッチするようにする
-            KeyCode::Left if key_event.modifiers.contains(KeyModifiers::SHIFT) => {
-                if self.sql.cursor_position > 0 {
-                    // 選択中でなければ現在位置を選択開始点として記録
-                    if self.sql.selection_start.is_none() {
-                        self.sql.selection_start = Some(self.sql.cursor_position);
-                    }
-                    self.sql.cursor_position -= 1;
+            KeyCode::Left
+                if key_event.modifiers.contains(KeyModifiers::SHIFT)
+                    && self.sql.cursor_position > 0 =>
+            {
+                // 選択中でなければ現在位置を選択開始点として記録
+                if self.sql.selection_start.is_none() {
+                    self.sql.selection_start = Some(self.sql.cursor_position);
                 }
+                self.sql.cursor_position -= 1;
             }
             // Shift+Right: 選択しながら右へ移動
             KeyCode::Right if key_event.modifiers.contains(KeyModifiers::SHIFT) => {
@@ -369,53 +370,51 @@ impl App {
                 self.sql.selection_start = None;
                 self.sql.cursor_position = self.sql.text.chars().count();
             }
-            KeyCode::Enter => {
-                if !self.sql.text.trim().is_empty() {
-                    // sc エイリアス: カラム選択モードに遷移（expand_aliases より前に処理する）
-                    if self.sql.text.trim().to_lowercase() == "sc" {
-                        self.sql.text.clear();
-                        self.sql.cursor_position = 0;
-                        self.selected_record = None;
-                        self.sql.selection_start = None;
-                        self.transition_to_column_select()?;
-                        return Ok(());
-                    }
-
-                    // 新しいクエリ実行時は選択レコードプレビューをクリア
+            KeyCode::Enter if !self.sql.text.trim().is_empty() => {
+                // sc エイリアス: カラム選択モードに遷移（expand_aliases より前に処理する）
+                if self.sql.text.trim().to_lowercase() == "sc" {
+                    self.sql.text.clear();
+                    self.sql.cursor_position = 0;
                     self.selected_record = None;
-                    // エイリアス展開してから実行
-                    self.expand_aliases();
+                    self.sql.selection_start = None;
+                    self.transition_to_column_select()?;
+                    return Ok(());
+                }
 
-                    self.add_to_history(&self.sql.text.clone());
+                // 新しいクエリ実行時は選択レコードプレビューをクリア
+                self.selected_record = None;
+                // エイリアス展開してから実行
+                self.expand_aliases();
 
-                    // エイリアス展開後にカーソルを末尾に合わせる
-                    self.sql.cursor_position = self.sql.text.chars().count();
+                self.add_to_history(&self.sql.text.clone());
 
-                    // readonlyモード: 書き込み系SQLをクライアント側で即座にブロックする
-                    // サーバー側でもブロックされるが、ユーザーへの即時フィードバックのため先にチェックする
-                    if self.is_current_readonly() && is_write_sql(&self.sql.text) {
-                        let current_state = std::mem::replace(
-                            &mut self.state,
-                            AppState::Selecting {
-                                connections: Vec::new(),
-                                selected_index: 0,
-                            },
-                        );
-                        self.state = AppState::Error {
-                            message: t!(TuiMsg::ReadonlyBlocked),
-                            previous_state: Box::new(current_state),
-                        };
-                        return Ok(());
-                    }
+                // エイリアス展開後にカーソルを末尾に合わせる
+                self.sql.cursor_position = self.sql.text.chars().count();
 
-                    let sql_upper = self.sql.text.trim().to_uppercase();
-                    if sql_upper.starts_with("USE ") || sql_upper.starts_with("SET ") {
-                        // 非表示コマンドは従来通りバックグラウンドクエリ実行
-                        self.execute_query()?;
-                    } else {
-                        // 表示クエリはストリーミングモードへ遷移
-                        self.transition_to_streaming()?;
-                    }
+                // readonlyモード: 書き込み系SQLをクライアント側で即座にブロックする
+                // サーバー側でもブロックされるが、ユーザーへの即時フィードバックのため先にチェックする
+                if self.is_current_readonly() && is_write_sql(&self.sql.text) {
+                    let current_state = std::mem::replace(
+                        &mut self.state,
+                        AppState::Selecting {
+                            connections: Vec::new(),
+                            selected_index: 0,
+                        },
+                    );
+                    self.state = AppState::Error {
+                        message: t!(TuiMsg::ReadonlyBlocked),
+                        previous_state: Box::new(current_state),
+                    };
+                    return Ok(());
+                }
+
+                let sql_upper = self.sql.text.trim().to_uppercase();
+                if sql_upper.starts_with("USE ") || sql_upper.starts_with("SET ") {
+                    // 非表示コマンドは従来通りバックグラウンドクエリ実行
+                    self.execute_query()?;
+                } else {
+                    // 表示クエリはストリーミングモードへ遷移
+                    self.transition_to_streaming()?;
                 }
             }
             // ↑キー: 履歴を遡る（古い方向へ）
@@ -827,10 +826,8 @@ impl App {
     pub(super) async fn handle_shell_input(&mut self, key_event: event::KeyEvent) -> Result<()> {
         match key_event.code {
             // Enter: トリム後が空でなければシェルコマンドを実行予約する
-            KeyCode::Enter => {
-                if !self.shell.text.trim().is_empty() {
-                    self.execute_shell_command();
-                }
+            KeyCode::Enter if !self.shell.text.trim().is_empty() => {
+                self.execute_shell_command();
             }
             // Ctrl+C: 終了
             KeyCode::Char('c') if key_event.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -903,10 +900,8 @@ impl App {
                 self.shell.cursor_position = self.shell_word_right(self.shell.cursor_position);
             }
             // Left: 1文字左へ移動
-            KeyCode::Left => {
-                if self.shell.cursor_position > 0 {
-                    self.shell.cursor_position -= 1;
-                }
+            KeyCode::Left if self.shell.cursor_position > 0 => {
+                self.shell.cursor_position -= 1;
             }
             // Right: 1文字右へ移動
             KeyCode::Right => {
@@ -916,12 +911,10 @@ impl App {
                 }
             }
             // Backspace: カーソル直前の1文字を削除
-            KeyCode::Backspace => {
-                if self.shell.cursor_position > 0 {
-                    let byte_pos = self.shell_char_to_byte(self.shell.cursor_position - 1);
-                    self.shell.text.remove(byte_pos);
-                    self.shell.cursor_position -= 1;
-                }
+            KeyCode::Backspace if self.shell.cursor_position > 0 => {
+                let byte_pos = self.shell_char_to_byte(self.shell.cursor_position - 1);
+                self.shell.text.remove(byte_pos);
+                self.shell.cursor_position -= 1;
             }
             // Delete: カーソル直後の1文字を削除
             KeyCode::Delete => {
