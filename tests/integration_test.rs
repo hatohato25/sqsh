@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::process::Command;
 use std::time::Duration;
 use testcontainers::clients::Cli;
-use testcontainers::core::{WaitFor};
+use testcontainers::core::WaitFor;
 use testcontainers::{Image, ImageArgs};
 
 /// 統合テスト用のMySQL接続設定を作成
@@ -186,7 +186,6 @@ async fn test_connection_with_invalid_credentials() {
     // MySQLサーバーが存在しない、または認証が失敗することを期待
     assert!(result.is_err(), "無効な認証情報での接続は失敗する");
 }
-
 
 #[tokio::test]
 async fn test_ssl_mode_configuration() {
