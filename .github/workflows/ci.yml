@@ -37,4 +37,7 @@ jobs:
         run: cargo clippy -- -D warnings
 
       - name: Test
+        env:
+          TESTCONTAINERS_HOST_OVERRIDE: 127.0.0.1
+          DOCKER_HOST: unix:///var/run/docker.sock
         run: cargo test

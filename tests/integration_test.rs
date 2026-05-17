@@ -4,12 +4,19 @@ use sqsh::config::{
 };
 use sqsh::connection::ConnectionManager;
 use sqsh::query;
+use std::collections::HashMap;
 use std::process::Command;
 use std::time::Duration;
 use testcontainers::clients::Cli;
-use testcontainers_modules::mysql::Mysql;
+use testcontainers::core::{WaitFor};
+use testcontainers::{Image, ImageArgs};
 
 /// 統合テスト用のMySQL接続設定を作成
+///
+/// testcontainers で起動する MySQL は MYSQL_ROOT_PASSWORD=testpass で設定するため
+/// 同じパスワードを使用する。
+/// sqlx は空パスワード + mysql_native_password の組み合わせで認証失敗するため
+/// 空でないパスワードを使う必要がある。
 fn create_test_mysql_config(host: &str, port: u16) -> ConnectionConfig {
     ConnectionConfig {
         name: "integration-test".to_string(),
@@ -19,13 +26,91 @@ fn create_test_mysql_config(host: &str, port: u16) -> ConnectionConfig {
             port,
             database: "test".to_string(),
             user: "root".to_string(),
-            password: Password::from("test"),
+            password: Password::from("testpass"),
             timeout: 10,
             ssl_mode: SslMode::Disabled, // テストコンテナではSSL無効
             pool: PoolConfigPartial::default(),
         },
         readonly: false,
     }
+}
+
+/// テスト用MySQLイメージの起動引数
+///
+/// mysql_native_password をデフォルト認証プラグインに設定する理由:
+/// caching_sha2_password は SSL なし環境で初回接続時に RSA 公開鍵交換が必要になり、
+/// sqlx の SslMode::Disabled 設定と組み合わせると認証に失敗するため。
+#[derive(Debug, Clone, Default)]
+struct MysqlArgs;
+
+impl ImageArgs for MysqlArgs {
+    fn into_iterator(self) -> Box<dyn Iterator<Item = String>> {
+        Box::new(
+            vec!["--default-authentication-plugin=mysql_native_password".to_owned()].into_iter(),
+        )
+    }
+}
+
+/// テスト用MySQLイメージのラッパー
+///
+/// GitHub Actions上ではDockerブリッジ経由でホストIPが 172.17.0.1 になるため
+/// root@172.17.0.1 からの接続が Access denied になる。
+/// MySQL公式Dockerイメージには MYSQL_ROOT_HOST 環境変数が存在しないため（MariaDB固有）、
+/// MySQL サーバー起動引数で mysql_native_password を有効化し、
+/// root@% ユーザーを作成して任意ホストからの接続を許可する。
+#[derive(Debug)]
+struct MysqlWithRemoteRoot {
+    env_vars: HashMap<String, String>,
+}
+
+impl Default for MysqlWithRemoteRoot {
+    fn default() -> Self {
+        let mut env_vars = HashMap::new();
+        env_vars.insert("MYSQL_DATABASE".to_owned(), "test".to_owned());
+        // 空パスワードは sqlx + mysql_native_password の組み合わせで認証失敗するため
+        // 空でないパスワードを設定する
+        env_vars.insert("MYSQL_ROOT_PASSWORD".to_owned(), "testpass".to_owned());
+        // MySQL 公式 Docker イメージが root@% を自動作成するよう MYSQL_ROOT_HOST を設定する。
+        // （MariaDB とは異なり MySQL 8.x でも有効）
+        // これにより Docker ブリッジ経由の 172.17.0.1 からの接続も許可される
+        env_vars.insert("MYSQL_ROOT_HOST".to_owned(), "%".to_owned());
+        Self { env_vars }
+    }
+}
+
+impl Image for MysqlWithRemoteRoot {
+    type Args = MysqlArgs;
+
+    fn name(&self) -> String {
+        "mysql".to_owned()
+    }
+
+    fn tag(&self) -> String {
+        // testcontainers-modules v0.3 と同じバージョンを使用
+        "8.1".to_owned()
+    }
+
+    fn ready_conditions(&self) -> Vec<WaitFor> {
+        // MySQL 公式 Docker イメージは2回起動する:
+        // 1回目（一時サーバー）: 初期化のため port: 0 で起動後すぐに停止
+        // 2回目（本番サーバー）: port: 3306 で起動、この時点で root@% が作成される
+        //
+        // "X Plugin ready for connections. Bind-address" は2回目の起動でのみ出力される。
+        // このメッセージの後、root@% の作成および FLUSH PRIVILEGES が完了するまで
+        // 若干の時間が必要なため WaitFor::seconds(1) を追加して確実に待機する。
+        vec![
+            WaitFor::message_on_stderr("X Plugin ready for connections. Bind-address"),
+            WaitFor::seconds(1),
+        ]
+    }
+
+    fn env_vars(&self) -> Box<dyn Iterator<Item = (&String, &String)> + '_> {
+        Box::new(self.env_vars.iter())
+    }
+}
+
+fn mysql_image() -> MysqlWithRemoteRoot {
+    MysqlWithRemoteRoot::default()
 }
 
 /// testcontainers が利用する docker CLI / daemon が使えるかを確認
@@ -60,7 +145,7 @@ async fn test_mysql_connection_with_testcontainers() {
     let docker = Cli::default();
 
     // MySQLコンテナを起動
-    let mysql_container = docker.run(Mysql::default());
+    let mysql_container = docker.run(mysql_image());
     let host = "127.0.0.1";
     let port = mysql_container.get_host_port_ipv4(3306);
 
@@ -102,6 +187,7 @@ async fn test_connection_with_invalid_credentials() {
     assert!(result.is_err(), "無効な認証情報での接続は失敗する");
 }
 
+
 #[tokio::test]
 async fn test_ssl_mode_configuration() {
     // SSL/TLS設定のバリエーションテスト
@@ -132,7 +218,7 @@ async fn test_end_to_end_query_execution() {
     }
 
     let docker = Cli::default();
-    let mysql_container = docker.run(Mysql::default());
+    let mysql_container = docker.run(mysql_image());
     let host = "127.0.0.1";
     let port = mysql_container.get_host_port_ipv4(3306);
 
@@ -241,7 +327,7 @@ async fn test_empty_result_set() {
     }
 
     let docker = Cli::default();
-    let mysql_container = docker.run(Mysql::default());
+    let mysql_container = docker.run(mysql_image());
     let host = "127.0.0.1";
     let port = mysql_container.get_host_port_ipv4(3306);
 
@@ -280,7 +366,7 @@ async fn test_query_timeout() {
     }
 
     let docker = Cli::default();
-    let mysql_container = docker.run(Mysql::default());
+    let mysql_container = docker.run(mysql_image());
     let host = "127.0.0.1";
     let port = mysql_container.get_host_port_ipv4(3306);
 
@@ -311,7 +397,7 @@ async fn test_null_values_in_result() {
     }
 
     let docker = Cli::default();
-    let mysql_container = docker.run(Mysql::default());
+    let mysql_container = docker.run(mysql_image());
     let host = "127.0.0.1";
     let port = mysql_container.get_host_port_ipv4(3306);
 
@@ -477,7 +563,7 @@ async fn test_readonly_mode_blocks_writes_across_pool() {
     }
 
     let docker = Cli::default();
-    let mysql_container = docker.run(Mysql::default());
+    let mysql_container = docker.run(mysql_image());
     let host = "127.0.0.1";
     let port = mysql_container.get_host_port_ipv4(3306);
 
@@ -522,7 +608,7 @@ async fn test_readonly_mode_blocks_insert() {
     }
 
     let docker = Cli::default();
-    let mysql_container = docker.run(Mysql::default());
+    let mysql_container = docker.run(mysql_image());
     let host = "127.0.0.1";
     let port = mysql_container.get_host_port_ipv4(3306);
 
