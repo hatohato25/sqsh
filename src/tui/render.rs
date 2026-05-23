@@ -209,14 +209,12 @@ impl App {
         } else {
             Style::default()
         };
-        let input_paragraph = Paragraph::new(input_text)
-            .wrap(Wrap { trim: false })
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(input_title)
-                    .border_style(sql_border_style),
-            );
+        let input_paragraph = Paragraph::new(input_text).wrap(Wrap { trim: false }).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(input_title)
+                .border_style(sql_border_style),
+        );
 
         frame.render_widget(input_paragraph, chunks[1]);
 
