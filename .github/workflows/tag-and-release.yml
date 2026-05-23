@@ -10,6 +10,8 @@ jobs:
   create-release:
     name: Determine Version and Create Release
     runs-on: ubuntu-slim
+    outputs:
+      next_tag: ${{ steps.version.outputs.next_tag }}
 
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -127,11 +129,11 @@ jobs:
           draft: false
           prerelease: false
 
-      - name: Trigger Build and Publish
-        # GITHUB_TOKEN によるタグプッシュは他ワークフローをトリガーしないため明示的に呼び出す
-        run: |
-          gh workflow run build-and-publish.yml \
-            --ref main \
-            --field tag_name=${{ steps.version.outputs.next_tag }}
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  build-and-publish:
+    name: Build and Publish
+    needs: create-release
+    uses: ./.github/workflows/build-and-publish.yml
+    with:
+      tag_name: ${{ needs.create-release.outputs.next_tag }}
+    permissions:
+      contents: write
