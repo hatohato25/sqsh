@@ -2,7 +2,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph},
+    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
     Frame,
 };
 
@@ -209,12 +209,14 @@ impl App {
         } else {
             Style::default()
         };
-        let input_paragraph = Paragraph::new(input_text).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(input_title)
-                .border_style(sql_border_style),
-        );
+        let input_paragraph = Paragraph::new(input_text)
+            .wrap(Wrap { trim: false })
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(input_title)
+                    .border_style(sql_border_style),
+            );
 
         frame.render_widget(input_paragraph, chunks[1]);
 
@@ -227,12 +229,14 @@ impl App {
         } else {
             Style::default()
         };
-        let shell_paragraph = Paragraph::new(self.shell.text.as_str()).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(shell_title)
-                .border_style(shell_border_style),
-        );
+        let shell_paragraph = Paragraph::new(self.shell.text.as_str())
+            .wrap(Wrap { trim: false })
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(shell_title)
+                    .border_style(shell_border_style),
+            );
         frame.render_widget(shell_paragraph, chunks[2]);
 
         // カーソルを表示（フォーカスに応じて SQL または Shell 入力エリアに描画）
@@ -247,11 +251,11 @@ impl App {
                     .take(self.sql.cursor_position)
                     .map(|c| unicode_width::UnicodeWidthChar::width(c).unwrap_or(1) as u16)
                     .sum();
-                let cursor_x = chunks[1].x + 1 + cursor_display_offset;
-                let cursor_y = chunks[1].y + 1;
+                // 折り返し対応: 内部幅（ボーダー2文字分を除く）で行列を計算する
+                let sql_inner_width = chunks[1].width.saturating_sub(2).max(1);
                 frame.set_cursor_position(ratatui::layout::Position {
-                    x: cursor_x,
-                    y: cursor_y,
+                    x: chunks[1].x + 1 + (cursor_display_offset % sql_inner_width),
+                    y: chunks[1].y + 1 + (cursor_display_offset / sql_inner_width),
                 });
             }
             InputFocus::Shell => {
@@ -263,11 +267,11 @@ impl App {
                     .take(self.shell.cursor_position)
                     .map(|c| unicode_width::UnicodeWidthChar::width(c).unwrap_or(1) as u16)
                     .sum();
-                let cursor_x = chunks[2].x + 1 + cursor_display_offset;
-                let cursor_y = chunks[2].y + 1;
+                // 折り返し対応: 内部幅（ボーダー2文字分を除く）で行列を計算する
+                let shell_inner_width = chunks[2].width.saturating_sub(2).max(1);
                 frame.set_cursor_position(ratatui::layout::Position {
-                    x: cursor_x,
-                    y: cursor_y,
+                    x: chunks[2].x + 1 + (cursor_display_offset % shell_inner_width),
+                    y: chunks[2].y + 1 + (cursor_display_offset / shell_inner_width),
                 });
             }
         };
