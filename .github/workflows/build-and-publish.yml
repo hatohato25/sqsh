@@ -4,6 +4,12 @@ on:
   push:
     tags:
       - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: 'Tag name to build (e.g. v0.3.0)'
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -22,6 +28,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ inputs.tag_name || github.ref }}
 
       - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # stable
         with:
@@ -34,7 +42,7 @@ jobs:
       - name: Create tarball
         id: tarball
         run: |
-          TARBALL="sqsh-${{ github.ref_name }}-${{ matrix.target }}.tar.gz"
+          TARBALL="sqsh-${{ inputs.tag_name || github.ref_name }}-${{ matrix.target }}.tar.gz"
           tar -czf "$TARBALL" -C target/${{ matrix.target }}/release sqsh
           shasum -a 256 "$TARBALL" > "$TARBALL.sha256"
           echo "name=$TARBALL" >> $GITHUB_OUTPUT
