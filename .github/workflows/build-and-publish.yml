@@ -52,6 +52,7 @@ jobs:
         uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v3.0.0
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
+          tag_name: ${{ inputs.tag_name || github.ref_name }}
           files: |
             ${{ steps.tarball.outputs.name }}
             ${{ steps.tarball.outputs.name }}.sha256
@@ -73,7 +74,7 @@ jobs:
 
       - name: Download sha256 files from release
         run: |
-          VERSION="${{ github.ref_name }}"
+          VERSION="${{ inputs.tag_name || github.ref_name }}"
           BASE_URL="https://github.com/hatohato25/sqsh/releases/download/${VERSION}"
 
           # sha256ファイルの形式は "<sha256値>  <ファイル名>" のため awk で先頭フィールドを取得する
