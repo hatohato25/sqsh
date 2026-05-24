@@ -135,5 +135,7 @@ jobs:
     uses: ./.github/workflows/build-and-publish.yml
     with:
       tag_name: ${{ needs.create-release.outputs.next_tag }}
+    secrets:
+      HOMEBREW_GITHUB_TOKEN: ${{ secrets.HOMEBREW_GITHUB_TOKEN }}
     permissions:
       contents: write
