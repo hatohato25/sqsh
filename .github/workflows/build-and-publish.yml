@@ -18,6 +18,9 @@ jobs:
   build:
     name: Build ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
+    env:
+      # workflow_call 経由では inputs.tag_name、タグ push 経由では github.ref_name を使う
+      TAG_NAME: ${{ inputs.tag_name != '' && inputs.tag_name || github.ref_name }}
     strategy:
       matrix:
         include:
@@ -29,7 +32,7 @@ jobs:
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
-          ref: ${{ inputs.tag_name || github.ref }}
+          ref: ${{ inputs.tag_name != '' && inputs.tag_name || github.ref }}
 
       - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # stable
         with:
@@ -42,7 +45,7 @@ jobs:
       - name: Create tarball
         id: tarball
         run: |
-          TARBALL="sqsh-${{ inputs.tag_name || github.ref_name }}-${{ matrix.target }}.tar.gz"
+          TARBALL="sqsh-${TAG_NAME}-${{ matrix.target }}.tar.gz"
           tar -czf "$TARBALL" -C target/${{ matrix.target }}/release sqsh
           shasum -a 256 "$TARBALL" > "$TARBALL.sha256"
           echo "name=$TARBALL" >> $GITHUB_OUTPUT
@@ -52,7 +55,7 @@ jobs:
         uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v3.0.0
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-          tag_name: ${{ inputs.tag_name || github.ref_name }}
+          tag_name: ${{ env.TAG_NAME }}
           files: |
             ${{ steps.tarball.outputs.name }}
             ${{ steps.tarball.outputs.name }}.sha256
@@ -74,7 +77,7 @@ jobs:
 
       - name: Download sha256 files from release
         run: |
-          VERSION="${{ inputs.tag_name || github.ref_name }}"
+          VERSION="${{ inputs.tag_name != '' && inputs.tag_name || github.ref_name }}"
           BASE_URL="https://github.com/hatohato25/sqsh/releases/download/${VERSION}"
 
           # sha256ファイルの形式は "<sha256値>  <ファイル名>" のため awk で先頭フィールドを取得する
