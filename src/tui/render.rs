@@ -576,7 +576,7 @@ pub(super) fn cursor_position_in_multiline(
         let line_rows = if line_display_width == 0 {
             1
         } else {
-            (line_display_width + inner_width - 1) / inner_width
+            line_display_width.div_ceil(inner_width)
         };
         y_offset += line_rows;
         // '\n' の1文字分を消費する
