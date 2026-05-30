@@ -221,6 +221,11 @@ Config file search order when `--config` is not specified:
 1. `~/.config/sqsh/config.toml`
 2. `./config.toml`
 
+> **Note:** If you use fish or another non-POSIX shell, the skim-based preview (fuzzy finder preview window) may not render correctly. In that case, prefix the command with `SHELL=/bin/bash`:
+> ```bash
+> SHELL=/bin/bash sqsh
+> ```
+
 ## Key Bindings
 
 ### Connection Selection
@@ -256,6 +261,7 @@ SQL input is handled directly by sqsh. Press `Tab` to switch focus between SQL I
 |-----|--------|
 | `Ctrl+A` | Select all |
 | `Ctrl+C` | Copy selection / quit (no selection) |
+| `Ctrl+J` | Insert newline (multi-line SQL) |
 | `Ctrl+V` | Paste from clipboard |
 | `Ctrl+X` | Cut selection |
 | `Ctrl+K` | Delete from cursor to end of line |
@@ -285,6 +291,7 @@ When connected via a bastion server, commands execute on the bastion host. For d
 | Key | Action |
 |-----|--------|
 | `Enter` | Execute command |
+| `Ctrl+J` | Insert newline (multi-line command) |
 | `Tab` | Switch focus to SQL Input |
 | `Up` / `Down` | Navigate shell history |
 | `Ctrl+A` / `Home` | Move cursor to start |
