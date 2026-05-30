@@ -315,7 +315,8 @@ impl<'a> TuiMsg<'a> {
             TuiMsg::SqlInputTitle => "SQL Input".to_string(),
             TuiMsg::SqlInputReadonlyLabel => "[READONLY]".to_string(),
             TuiMsg::SqlInputTitleSuffix => {
-                "(Enter: run, Ctrl+D: databases, Ctrl+T: tables)".to_string()
+                "(Enter: run, Ctrl+J: newline, Ctrl+D: databases, Ctrl+T: tables)"
+                    .to_string()
             }
             TuiMsg::ConnectionInfo => "Connection Info".to_string(),
             TuiMsg::ConnectionTarget => "Target".to_string(),
@@ -324,7 +325,7 @@ impl<'a> TuiMsg<'a> {
             TuiMsg::Database => "Database".to_string(),
             TuiMsg::SelectedDatabase => "Selected Database".to_string(),
             TuiMsg::ConnectedHelp => {
-                "Tab: switch focus | Enter: run | Ctrl+D: SHOW DATABASES | Ctrl+T: SHOW TABLES | Ctrl+S: select columns | q: quit | sd/st/sc: alias"
+                "Tab: switch focus | Enter: run | Ctrl+J: newline | Ctrl+D: SHOW DATABASES | Ctrl+T: SHOW TABLES | Ctrl+S: select columns | q: quit | sd/st/sc: alias"
                     .to_string()
             }
             TuiMsg::QueryHelp => "Enter: run query | q: quit".to_string(),
@@ -359,7 +360,9 @@ impl<'a> TuiMsg<'a> {
             TuiMsg::ReadonlyBlocked => {
                 "Write operations are not allowed in readonly mode.".to_string()
             }
-            TuiMsg::ShellInputTitleFocused => "Shell Input (Enter: run)".to_string(),
+            TuiMsg::ShellInputTitleFocused => {
+                "Shell Input (Enter: run, Ctrl+J: newline)".to_string()
+            }
         }
     }
 
@@ -375,7 +378,8 @@ impl<'a> TuiMsg<'a> {
             TuiMsg::SqlInputTitle => "SQL入力".to_string(),
             TuiMsg::SqlInputReadonlyLabel => "[READONLY]".to_string(),
             TuiMsg::SqlInputTitleSuffix => {
-                "(Enter: 実行, Ctrl+D: DB一覧, Ctrl+T: テーブル一覧)".to_string()
+                "(Enter: 実行, Ctrl+J: 改行, Ctrl+D: DB一覧, Ctrl+T: テーブル一覧)"
+                    .to_string()
             }
             TuiMsg::ConnectionInfo => "接続情報".to_string(),
             TuiMsg::ConnectionTarget => "接続先".to_string(),
@@ -384,7 +388,7 @@ impl<'a> TuiMsg<'a> {
             TuiMsg::Database => "データベース".to_string(),
             TuiMsg::SelectedDatabase => "選択データベース".to_string(),
             TuiMsg::ConnectedHelp => {
-                "Tab: フォーカス切替 | Enter: 実行 | Ctrl+D: SHOW DATABASES | Ctrl+T: SHOW TABLES | Ctrl+S: カラム選択 | q: 終了 | sd/st/sc: エイリアス"
+                "Tab: フォーカス切替 | Enter: 実行 | Ctrl+J: 改行 | Ctrl+D: SHOW DATABASES | Ctrl+T: SHOW TABLES | Ctrl+S: カラム選択 | q: 終了 | sd/st/sc: エイリアス"
                     .to_string()
             }
             TuiMsg::QueryHelp => "Enter: クエリ実行 | q: 終了".to_string(),
@@ -416,7 +420,9 @@ impl<'a> TuiMsg<'a> {
             TuiMsg::ReadonlyBlocked => {
                 "readonlyモードのため、書き込み操作は実行できません。".to_string()
             }
-            TuiMsg::ShellInputTitleFocused => "SHELL入力 (Enter: 実行)".to_string(),
+            TuiMsg::ShellInputTitleFocused => {
+                "SHELL入力 (Enter: 実行, Ctrl+J: 改行)".to_string()
+            }
         }
     }
 

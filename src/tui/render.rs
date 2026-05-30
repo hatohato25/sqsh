@@ -168,23 +168,12 @@ impl App {
         }
 
         // SQL入力エリア（選択範囲がある場合はハイライト表示）
-        let input_line = if let Some(sel_start) = self.sql.selection_start {
-            let start = sel_start.min(self.sql.cursor_position);
-            let end = sel_start.max(self.sql.cursor_position);
-            let byte_start = self.char_to_byte(start);
-            let byte_end = self.char_to_byte(end);
-            let before = &self.sql.text[..byte_start];
-            let selected = &self.sql.text[byte_start..byte_end];
-            let after = &self.sql.text[byte_end..];
-            Line::from(vec![
-                Span::raw(before),
-                Span::styled(selected, Style::default().bg(Color::Blue).fg(Color::White)),
-                Span::raw(after),
-            ])
-        } else {
-            Line::from(self.sql.text.as_str())
-        };
-        let input_text = Text::from(input_line);
+        // \n で論理行に分割して複数行描画に対応する
+        let input_text = build_multiline_text(
+            &self.sql.text,
+            self.sql.selection_start,
+            self.sql.cursor_position,
+        );
         // readonlyモード時はタイトルの [READONLY] 部分を赤色+太字で目立たせる
         // フォーカス時は Yellow ボーダーで強調する
         let sql_focused = self.input_focus == InputFocus::Sql;
@@ -227,49 +216,42 @@ impl App {
         } else {
             Style::default()
         };
-        let shell_paragraph = Paragraph::new(self.shell.text.as_str())
-            .wrap(Wrap { trim: false })
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(shell_title)
-                    .border_style(shell_border_style),
-            );
+        // Shell入力も \n 分割で複数行描画に対応する（選択範囲なし）
+        let shell_text = build_multiline_text(&self.shell.text, None, self.shell.cursor_position);
+        let shell_paragraph = Paragraph::new(shell_text).wrap(Wrap { trim: false }).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(shell_title)
+                .border_style(shell_border_style),
+        );
         frame.render_widget(shell_paragraph, chunks[2]);
 
         // カーソルを表示（フォーカスに応じて SQL または Shell 入力エリアに描画）
-        let cursor_display_offset: u16;
         match self.input_focus {
             InputFocus::Sql => {
-                // SQL入力エリアのカーソル（cursor_positionはchar単位→表示幅に変換）
-                cursor_display_offset = self
-                    .sql
-                    .text
-                    .chars()
-                    .take(self.sql.cursor_position)
-                    .map(|c| unicode_width::UnicodeWidthChar::width(c).unwrap_or(1) as u16)
-                    .sum();
-                // 折り返し対応: 内部幅（ボーダー2文字分を除く）で行列を計算する
+                // 論理行（\n区切り）と折り返しを両方考慮してカーソル位置を計算する
                 let sql_inner_width = chunks[1].width.saturating_sub(2).max(1);
+                let (cx, cy) = cursor_position_in_multiline(
+                    &self.sql.text,
+                    self.sql.cursor_position,
+                    sql_inner_width,
+                );
                 frame.set_cursor_position(ratatui::layout::Position {
-                    x: chunks[1].x + 1 + (cursor_display_offset % sql_inner_width),
-                    y: chunks[1].y + 1 + (cursor_display_offset / sql_inner_width),
+                    x: chunks[1].x + 1 + cx,
+                    y: chunks[1].y + 1 + cy,
                 });
             }
             InputFocus::Shell => {
-                // Shell入力エリアのカーソル（shell.cursor_positionはchar単位→表示幅に変換）
-                cursor_display_offset = self
-                    .shell
-                    .text
-                    .chars()
-                    .take(self.shell.cursor_position)
-                    .map(|c| unicode_width::UnicodeWidthChar::width(c).unwrap_or(1) as u16)
-                    .sum();
-                // 折り返し対応: 内部幅（ボーダー2文字分を除く）で行列を計算する
+                // 論理行（\n区切り）と折り返しを両方考慮してカーソル位置を計算する
                 let shell_inner_width = chunks[2].width.saturating_sub(2).max(1);
+                let (cx, cy) = cursor_position_in_multiline(
+                    &self.shell.text,
+                    self.shell.cursor_position,
+                    shell_inner_width,
+                );
                 frame.set_cursor_position(ratatui::layout::Position {
-                    x: chunks[2].x + 1 + (cursor_display_offset % shell_inner_width),
-                    y: chunks[2].y + 1 + (cursor_display_offset / shell_inner_width),
+                    x: chunks[2].x + 1 + cx,
+                    y: chunks[2].y + 1 + cy,
                 });
             }
         };
@@ -357,17 +339,16 @@ impl App {
         if self.input_focus == InputFocus::Sql {
             if let Some(ref comp_state) = self.sql.completion_state {
                 if !comp_state.candidates.is_empty() {
-                    // SQL フォーカス時は cursor_display_offset が Sql ブランチで計算済みなので再計算する
-                    let sql_cursor_offset: u16 = self
-                        .sql
-                        .text
-                        .chars()
-                        .take(self.sql.cursor_position)
-                        .map(|c| unicode_width::UnicodeWidthChar::width(c).unwrap_or(1) as u16)
-                        .sum();
+                    // 複数行・折り返しを考慮したカーソルx位置でポップアップを配置する
+                    let sql_inner_width = chunks[1].width.saturating_sub(2).max(1);
+                    let (sql_cursor_x, _) = cursor_position_in_multiline(
+                        &self.sql.text,
+                        self.sql.cursor_position,
+                        sql_inner_width,
+                    );
                     let popup_rect = completion_popup_rect(
                         chunks[1],
-                        sql_cursor_offset,
+                        sql_cursor_x,
                         comp_state.candidates.len(),
                         frame.area(),
                     );
@@ -490,6 +471,120 @@ pub(super) fn completion_popup_rect(
     };
 
     Rect::new(popup_x, popup_y, MAX_POPUP_WIDTH, popup_height)
+}
+
+/// テキストを \n で論理行に分割して選択ハイライト付きの Text を構築する
+///
+/// `selection_start` が Some の場合は選択範囲を青背景でハイライトする。
+/// 各論理行は独立した Line になるため、ratatui の Wrap::trim:false と組み合わせて
+/// 正しい複数行表示が得られる。
+pub(super) fn build_multiline_text<'a>(
+    text: &'a str,
+    selection_start: Option<usize>,
+    cursor_position: usize,
+) -> Text<'a> {
+    let highlight_style = Style::default().bg(Color::Blue).fg(Color::White);
+
+    // 選択範囲の char インデックス（開始・終了）を計算する
+    let (sel_char_start, sel_char_end) = if let Some(sel_start) = selection_start {
+        let s = sel_start.min(cursor_position);
+        let e = sel_start.max(cursor_position);
+        (Some(s), Some(e))
+    } else {
+        (None, None)
+    };
+
+    // 各論理行のチャー開始位置を追跡しながら Line を構築する
+    let mut lines: Vec<Line<'a>> = Vec::new();
+    let mut line_char_start = 0usize;
+
+    for logical_line in text.split('\n') {
+        let line_char_end = line_char_start + logical_line.chars().count();
+
+        let line = if let (Some(ss), Some(se)) = (sel_char_start, sel_char_end) {
+            // 選択範囲がこの論理行に重なるかを判定する
+            let overlap_start = ss.max(line_char_start);
+            let overlap_end = se.min(line_char_end);
+
+            if overlap_start < overlap_end {
+                // 重なりあり: 行内バイトオフセットに変換してスパンを分割する
+                let before_chars = overlap_start - line_char_start;
+                let sel_chars = overlap_end - overlap_start;
+                let after_chars = line_char_end - overlap_end;
+
+                let mut char_iter = logical_line.chars();
+                let before: String = char_iter.by_ref().take(before_chars).collect();
+                let selected: String = char_iter.by_ref().take(sel_chars).collect();
+                let after: String = char_iter.take(after_chars).collect();
+
+                Line::from(vec![
+                    Span::raw(before),
+                    Span::styled(selected, highlight_style),
+                    Span::raw(after),
+                ])
+            } else {
+                Line::raw(logical_line)
+            }
+        } else {
+            Line::raw(logical_line)
+        };
+
+        lines.push(line);
+        // 次の論理行の開始位置 = 現在の行文字数 + '\n' の1文字分
+        line_char_start = line_char_end + 1;
+    }
+
+    Text::from(lines)
+}
+
+/// カーソルの表示位置 (x, y) を論理行と折り返しを考慮して計算する
+///
+/// 各論理行は `inner_width` 幅で折り返されるため、y 座標は前の論理行の
+/// 折り返し行数を累積することで求める。
+/// 戻り値は (x_offset, y_offset) で、ボーダー内の相対位置（0ベース）。
+pub(super) fn cursor_position_in_multiline(
+    text: &str,
+    cursor_char_pos: usize,
+    inner_width: u16,
+) -> (u16, u16) {
+    let inner_width = inner_width as usize;
+    let mut remaining_chars = cursor_char_pos;
+    let mut y_offset: usize = 0;
+
+    for logical_line in text.split('\n') {
+        let line_char_count = logical_line.chars().count();
+
+        if remaining_chars <= line_char_count {
+            // カーソルはこの論理行内にある: 行内の表示幅オフセットを計算する
+            let display_width_before_cursor: usize = logical_line
+                .chars()
+                .take(remaining_chars)
+                .map(|c| unicode_width::UnicodeWidthChar::width(c).unwrap_or(1))
+                .sum();
+
+            let x = (display_width_before_cursor % inner_width) as u16;
+            let y = (y_offset + display_width_before_cursor / inner_width) as u16;
+            return (x, y);
+        }
+
+        // カーソルはまだ先の行: この論理行が何行分折り返されるかを加算する
+        let line_display_width: usize = logical_line
+            .chars()
+            .map(|c| unicode_width::UnicodeWidthChar::width(c).unwrap_or(1))
+            .sum();
+        // 空行は1行分として数える（折り返しなしの場合も1行占有するため）
+        let line_rows = if line_display_width == 0 {
+            1
+        } else {
+            (line_display_width + inner_width - 1) / inner_width
+        };
+        y_offset += line_rows;
+        // '\n' の1文字分を消費する
+        remaining_chars -= line_char_count + 1;
+    }
+
+    // テキスト末尾（通常は到達しないが安全のため）
+    (0, y_offset as u16)
 }
 
 /// 補完ポップアップを描画する

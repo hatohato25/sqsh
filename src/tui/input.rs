@@ -124,14 +124,20 @@ impl App {
                     self.sql.selection_start = None;
                 }
             }
+            // Ctrl+J: 改行挿入
+            KeyCode::Char('j') if key_event.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.delete_selection();
+                let byte_pos = self.char_to_byte(self.sql.cursor_position);
+                self.sql.text.insert(byte_pos, '\n');
+                self.sql.cursor_position += 1;
+            }
             // Ctrl+V: クリップボードからペースト
-            // SQL入力欄は1行のため、改行文字はスペースに変換して挿入する
             KeyCode::Char('v') if key_event.modifiers.contains(KeyModifiers::CONTROL) => {
                 // 選択範囲があれば先に削除（上書きペースト）
                 self.delete_selection();
                 if let Ok(mut clipboard) = arboard::Clipboard::new() {
                     if let Ok(text) = clipboard.get_text() {
-                        let sanitized = text.replace('\n', " ").replace('\r', "");
+                        let sanitized = text.replace('\r', "");
                         let byte_pos = self.char_to_byte(self.sql.cursor_position);
                         self.sql.text.insert_str(byte_pos, &sanitized);
                         self.sql.cursor_position += sanitized.chars().count();
@@ -928,6 +934,12 @@ impl App {
             KeyCode::Esc => {
                 self.shell.text.clear();
                 self.shell.cursor_position = 0;
+            }
+            // Ctrl+J: 改行挿入
+            KeyCode::Char('j') if key_event.modifiers.contains(KeyModifiers::CONTROL) => {
+                let byte_pos = self.shell_char_to_byte(self.shell.cursor_position);
+                self.shell.text.insert(byte_pos, '\n');
+                self.shell.cursor_position += 1;
             }
             // 通常の文字入力
             KeyCode::Char(c) => {
