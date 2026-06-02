@@ -117,14 +117,21 @@ fn init_logging(verbose: bool) -> Result<()> {
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"))
     };
 
-    // ログをファイルに出力（TUI表示と干渉しないようにする）
-    let log_dir = std::env::temp_dir().join("sqsh");
+    // ログをファイルに出力（TUI表示と干渉しないよう /tmp/sqsh/sqsh.log に固定する）
+    // macOS の std::env::temp_dir() は予測しにくいパスを返すため、常に利用可能な /tmp を使用する
+    let log_dir = std::path::PathBuf::from("/tmp/sqsh");
     std::fs::create_dir_all(&log_dir)?;
-    let log_file = std::fs::File::create(log_dir.join("sqsh.log"))?;
+    let log_path = log_dir.join("sqsh.log");
+
+    let log_file = std::fs::File::create(&log_path)?;
 
     tracing_subscriber::registry()
         .with(filter)
-        .with(fmt::layer().with_writer(log_file).with_ansi(false))
+        .with(
+            fmt::layer()
+                .with_writer(std::sync::Mutex::new(log_file))
+                .with_ansi(false),
+        )
         .init();
 
     Ok(())

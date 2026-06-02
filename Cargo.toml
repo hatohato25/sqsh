@@ -16,7 +16,8 @@ ratatui = "0.29"
 crossterm = "0.28"
 
 # Database
-sqlx = { version = "0.7", features = ["runtime-tokio", "tls-rustls", "mysql"] }
+sqlx = { version = "0.7", features = ["runtime-tokio", "tls-rustls", "mysql", "chrono"] }
+chrono = "0.4"
 tokio = { version = "1", features = ["full"] }
 futures = "0.3"
 

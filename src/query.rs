@@ -1,3 +1,4 @@
+use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, Utc};
 use sqlx::{Column, Executor, MySql, Pool, Row as SqlxRow, TypeInfo, ValueRef};
 use std::time::{Duration, Instant};
 
@@ -32,42 +33,73 @@ pub(crate) fn convert_value_to_string(
 
         // 型名に応じて適切に変換し、制御文字をサニタイズして返す
         // skimは1行=1アイテムのため、改行等が含まれるとUI崩れの原因になる
-        let raw = match type_name {
-            "TINYINT" | "TINYINT UNSIGNED" | "SMALLINT" | "SMALLINT UNSIGNED" | "MEDIUMINT"
-            | "MEDIUMINT UNSIGNED" | "INT" | "INT UNSIGNED" | "BIGINT" | "BIGINT UNSIGNED" => {
-                // 整数型（UNSIGNED含む）
-                // UNSIGNEDでも i64 で十分な範囲（BIGINT UNSIGNED の最大値は u64 だが大半は収まる）
-                row.try_get::<i64, _>(index)
-                    .map(|v| v.to_string())
-                    .or_else(|_| row.try_get::<u64, _>(index).map(|v| v.to_string()))
-                    .unwrap_or_else(|_| String::from("NULL"))
-            }
-            "FLOAT" | "DOUBLE" | "DECIMAL" | "FLOAT UNSIGNED" | "DOUBLE UNSIGNED"
-            | "DECIMAL UNSIGNED" => {
-                // 浮動小数点型（UNSIGNED含む）
-                row.try_get::<f64, _>(index)
-                    .map(|v| v.to_string())
-                    .unwrap_or_else(|_| String::from("NULL"))
-            }
-            "VARCHAR" | "CHAR" | "TEXT" | "TINYTEXT" | "MEDIUMTEXT" | "LONGTEXT" => {
-                // 文字列型
-                row.try_get::<String, _>(index)
-                    .unwrap_or_else(|_| String::from("NULL"))
-            }
-            "DATE" | "DATETIME" | "TIMESTAMP" | "TIME" => {
-                // 日付時刻型
-                row.try_get::<String, _>(index)
-                    .unwrap_or_else(|_| String::from("NULL"))
-            }
-            "BLOB" | "TINYBLOB" | "MEDIUMBLOB" | "LONGBLOB" => {
-                // バイナリ型は表示しない
-                String::from("[BLOB]")
-            }
-            _ => {
-                // その他の型は文字列として取得を試みる
-                row.try_get::<String, _>(index)
-                    .unwrap_or_else(|_| format!("[{}]", type_name))
-            }
+        //
+        // type_name は MySQL サーバーから "DATETIME(6)" のように精度付きで返される場合があるため、
+        // 完全一致ではなく starts_with / contains で判定する。
+        let raw = if type_name.starts_with("TINYINT")
+            || type_name.starts_with("SMALLINT")
+            || type_name.starts_with("MEDIUMINT")
+            || type_name.starts_with("INT")
+            || type_name.starts_with("BIGINT")
+        {
+            // 整数型（UNSIGNED含む、精度付き含む）
+            // UNSIGNEDでも i64 で十分な範囲（BIGINT UNSIGNED の最大値は u64 だが大半は収まる）
+            row.try_get::<i64, _>(index)
+                .map(|v| v.to_string())
+                .or_else(|_| row.try_get::<u64, _>(index).map(|v| v.to_string()))
+                .unwrap_or_else(|_| String::from("NULL"))
+        } else if type_name.starts_with("FLOAT")
+            || type_name.starts_with("DOUBLE")
+            || type_name.starts_with("DECIMAL")
+        {
+            // 浮動小数点型（UNSIGNED含む、精度付き含む）
+            row.try_get::<f64, _>(index)
+                .map(|v| v.to_string())
+                .unwrap_or_else(|_| String::from("NULL"))
+        } else if type_name == "VARCHAR"
+            || type_name == "CHAR"
+            || type_name.starts_with("TEXT")
+            || type_name == "TINYTEXT"
+            || type_name == "MEDIUMTEXT"
+            || type_name == "LONGTEXT"
+        {
+            // 文字列型
+            row.try_get::<String, _>(index)
+                .unwrap_or_else(|_| String::from("NULL"))
+        } else if type_name.starts_with("DATETIME") {
+            // DATETIME型（"DATETIME(6)" 等の精度付きも含む）
+            // NaiveDateTime → Option<NaiveDateTime> → String の順でフォールバックする。
+            // nullable カラムでは Option<NaiveDateTime> が要求される場合があり、
+            // text protocol では文字列として返ってくることもある。
+            // 注: "DATE" より前にチェックすること（starts_with("DATE") が DATETIME にもマッチするため）
+            decode_naive_datetime(row, index)
+        } else if type_name.starts_with("TIMESTAMP") {
+            // TIMESTAMP型: MySQL の TIMESTAMP は timezone-aware なため DateTime<Utc> でデコードする。
+            // NaiveDateTime では型不一致エラー（SQL type TIMESTAMP vs Rust type DATETIME）が発生する。
+            decode_timestamp(row, index)
+        } else if type_name.starts_with("DATE") {
+            // DATE型（精度付きも含む）
+            decode_naive_date(row, index)
+        } else if type_name.starts_with("TIME") {
+            // TIME型（精度付きも含む）
+            decode_naive_time(row, index)
+        } else if type_name == "YEAR" {
+            // YEAR型: MySQL の YEAR 型は 1901-2155 の範囲で i16/u16 として返ってくる
+            row.try_get::<i16, _>(index)
+                .map(|v| v.to_string())
+                .or_else(|_| row.try_get::<u16, _>(index).map(|v| v.to_string()))
+                .unwrap_or_else(|_| String::from("NULL"))
+        } else if type_name == "BLOB"
+            || type_name == "TINYBLOB"
+            || type_name == "MEDIUMBLOB"
+            || type_name == "LONGBLOB"
+        {
+            // バイナリ型は表示しない
+            String::from("[BLOB]")
+        } else {
+            // 未知の型は String として取得する
+            row.try_get::<String, _>(index)
+                .unwrap_or_else(|_| format!("[{}]", type_name))
         };
 
         // 改行・タブ等の制御文字を置換（skim表示のUI崩れ防止）
@@ -75,6 +107,84 @@ pub(crate) fn convert_value_to_string(
     } else {
         String::from("NULL")
     }
+}
+
+/// DATETIME カラムを文字列に変換する
+///
+/// NaiveDateTime → Option<NaiveDateTime> → String の順にフォールバックする。
+/// TIMESTAMP は timezone-aware のため decode_timestamp を使うこと。
+fn decode_naive_datetime(row: &sqlx::mysql::MySqlRow, index: usize) -> String {
+    // まず NaiveDateTime で試みる
+    if let Ok(v) = row.try_get::<NaiveDateTime, _>(index) {
+        return v.format("%Y-%m-%d %H:%M:%S").to_string();
+    }
+    // nullable カラムでは Option<NaiveDateTime> が必要な場合がある
+    match row.try_get::<Option<NaiveDateTime>, _>(index) {
+        Ok(Some(v)) => return v.format("%Y-%m-%d %H:%M:%S").to_string(),
+        Ok(None) => return String::from("NULL"),
+        Err(_) => {}
+    }
+    // text protocol では文字列として返ってくる場合がある
+    row.try_get::<String, _>(index)
+        .unwrap_or_else(|_| String::from("NULL"))
+}
+
+/// TIMESTAMP カラムを文字列に変換する
+///
+/// MySQL の TIMESTAMP は timezone-aware なため、NaiveDateTime では型不一致エラーになる。
+/// DateTime<Utc> → Option<DateTime<Utc>> → NaiveDateTime → String の順にフォールバックする。
+/// NaiveDateTime フォールバックは text protocol など一部環境で TIMESTAMP が
+/// timezone なしで返ってくるケースに備えるための念のための対処。
+fn decode_timestamp(row: &sqlx::mysql::MySqlRow, index: usize) -> String {
+    // まず DateTime<Utc> で試みる（標準的なTIMESTAMPのデコードパス）
+    if let Ok(v) = row.try_get::<DateTime<Utc>, _>(index) {
+        return v.format("%Y-%m-%d %H:%M:%S").to_string();
+    }
+    // nullable カラムでは Option<DateTime<Utc>> が必要な場合がある
+    match row.try_get::<Option<DateTime<Utc>>, _>(index) {
+        Ok(Some(v)) => return v.format("%Y-%m-%d %H:%M:%S").to_string(),
+        Ok(None) => return String::from("NULL"),
+        Err(_) => {}
+    }
+    // text protocol など一部環境では NaiveDateTime として返ってくる場合がある
+    if let Ok(v) = row.try_get::<NaiveDateTime, _>(index) {
+        return v.format("%Y-%m-%d %H:%M:%S").to_string();
+    }
+    // 最終フォールバック: 文字列として取得
+    row.try_get::<String, _>(index)
+        .unwrap_or_else(|_| String::from("NULL"))
+}
+
+/// DATE カラムを文字列に変換する
+///
+/// NaiveDate → Option<NaiveDate> → String の順にフォールバックする。
+fn decode_naive_date(row: &sqlx::mysql::MySqlRow, index: usize) -> String {
+    if let Ok(v) = row.try_get::<NaiveDate, _>(index) {
+        return v.format("%Y-%m-%d").to_string();
+    }
+    match row.try_get::<Option<NaiveDate>, _>(index) {
+        Ok(Some(v)) => return v.format("%Y-%m-%d").to_string(),
+        Ok(None) => return String::from("NULL"),
+        Err(_) => {}
+    }
+    row.try_get::<String, _>(index)
+        .unwrap_or_else(|_| String::from("NULL"))
+}
+
+/// TIME カラムを文字列に変換する
+///
+/// NaiveTime → Option<NaiveTime> → String の順にフォールバックする。
+fn decode_naive_time(row: &sqlx::mysql::MySqlRow, index: usize) -> String {
+    if let Ok(v) = row.try_get::<NaiveTime, _>(index) {
+        return v.format("%H:%M:%S").to_string();
+    }
+    match row.try_get::<Option<NaiveTime>, _>(index) {
+        Ok(Some(v)) => return v.format("%H:%M:%S").to_string(),
+        Ok(None) => return String::from("NULL"),
+        Err(_) => {}
+    }
+    row.try_get::<String, _>(index)
+        .unwrap_or_else(|_| String::from("NULL"))
 }
 
 /// 制御文字を表示用に置換する
