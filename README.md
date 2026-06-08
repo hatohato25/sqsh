@@ -24,6 +24,14 @@ brew tap hatohato25/sqsh
 brew install sqsh
 ```
 
+### Linux / WSL (Windows Subsystem for Linux)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/hatohato25/sqsh/main/install.sh | bash
+```
+
+The script automatically detects your architecture, downloads the appropriate binary from [GitHub Releases](https://github.com/hatohato25/sqsh/releases), verifies its checksum, and installs it to `/usr/local/bin` (with sudo) or `~/.local/bin` (without sudo).
+
 ### From Source
 
 ```bash

@@ -31,6 +31,8 @@ jobs:
             target: aarch64-apple-darwin
           - os: macos-latest
             target: x86_64-apple-darwin
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
 
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -42,6 +44,10 @@ jobs:
           toolchain: stable
           targets: ${{ matrix.target }}
 
+      - name: Install musl-tools
+        if: contains(matrix.target, 'linux-musl')
+        run: sudo apt-get install -y musl-tools
+
       - name: Build
         run: cargo build --release --target ${{ matrix.target }}
 
@@ -50,9 +56,14 @@ jobs:
         run: |
           TARBALL="sqsh-${TAG_NAME}-${{ matrix.target }}.tar.gz"
           tar -czf "$TARBALL" -C target/${{ matrix.target }}/release sqsh
-          shasum -a 256 "$TARBALL" > "$TARBALL.sha256"
+          if [[ "${{ matrix.os }}" == "ubuntu-latest" ]]; then
+            sha256sum "$TARBALL" > "$TARBALL.sha256"
+            echo "sha256=$(sha256sum $TARBALL | cut -d' ' -f1)" >> $GITHUB_OUTPUT
+          else
+            shasum -a 256 "$TARBALL" > "$TARBALL.sha256"
+            echo "sha256=$(shasum -a 256 $TARBALL | cut -d' ' -f1)" >> $GITHUB_OUTPUT
+          fi
           echo "name=$TARBALL" >> $GITHUB_OUTPUT
-          echo "sha256=$(shasum -a 256 $TARBALL | cut -d' ' -f1)" >> $GITHUB_OUTPUT
 
       - name: Upload to GitHub Releases
         uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v3.0.0
