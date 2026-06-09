@@ -2788,6 +2788,7 @@ dependencies = [
  "mockall",
  "ratatui",
  "serde",
+ "serde_json",
  "shellexpand",
  "skim",
  "sqlx",

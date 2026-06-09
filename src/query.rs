@@ -41,8 +41,12 @@ pub(crate) fn convert_value_to_string(
             || type_name.starts_with("MEDIUMINT")
             || type_name.starts_with("INT")
             || type_name.starts_with("BIGINT")
+            || type_name.eq_ignore_ascii_case("BOOLEAN")
+            || type_name.eq_ignore_ascii_case("BOOL")
         {
             // 整数型（UNSIGNED含む、精度付き含む）
+            // MySQL の BOOLEAN/BOOL は内部的に TINYINT(1) であり、sqlx が返す type_name が
+            // "BOOLEAN" になる場合があるため、整数型と同じブランチで i64 としてデコードする。
             // UNSIGNEDでも i64 で十分な範囲（BIGINT UNSIGNED の最大値は u64 だが大半は収まる）
             row.try_get::<i64, _>(index)
                 .map(|v| v.to_string())
@@ -88,6 +92,16 @@ pub(crate) fn convert_value_to_string(
             row.try_get::<i16, _>(index)
                 .map(|v| v.to_string())
                 .or_else(|_| row.try_get::<u16, _>(index).map(|v| v.to_string()))
+                .unwrap_or_else(|_| String::from("NULL"))
+        } else if type_name.eq_ignore_ascii_case("JSON") {
+            // JSON型: sqlx の "json" feature を有効にすることで serde_json::Value として
+            // デコード可能になる。binary protocol での JSON カラムは String や Vec<u8> では
+            // 型不一致エラーになるが、serde_json::Value は sqlx の JSON feature が
+            // 適切なデコードを提供するため正常に取得できる。
+            // 大文字小文字を無視して比較するのは MySQL サーバーの返す type_name が
+            // "JSON" / "Json" / "json" 等、環境により異なる場合があるため。
+            row.try_get::<serde_json::Value, _>(index)
+                .map(|v| v.to_string())
                 .unwrap_or_else(|_| String::from("NULL"))
         } else if type_name == "BLOB"
             || type_name == "TINYBLOB"
