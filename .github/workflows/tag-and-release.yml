@@ -39,8 +39,8 @@ jobs:
             MAJOR=$((MAJOR + 1))
             MINOR=0
             PATCH=0
-          # feat: を含む場合はマイナーバージョンアップ
-          elif echo "$COMMITS" | grep -qE '^feat(\(.+\))?:'; then
+          # feat: を含む場合はマイナーバージョンアップ（"mod feat:" のようなプレフィックス付きも対象）
+          elif echo "$COMMITS" | grep -qE '(^|[[:space:]])feat(\(.+\))?:'; then
             MINOR=$((MINOR + 1))
             PATCH=0
           else
@@ -70,11 +70,11 @@ jobs:
             HASH=$(echo "$line" | cut -d' ' -f1)
             MSG=$(echo "$line" | cut -d' ' -f2-)
 
-            if echo "$MSG" | grep -qE '^feat(\(.+\))?[!]?:'; then
+            if echo "$MSG" | grep -qE '(^|[[:space:]])feat(\(.+\))?[!]?:'; then
               FEATURES="${FEATURES}- ${MSG} (${HASH})\n"
-            elif echo "$MSG" | grep -qE '^fix(\(.+\))?[!]?:'; then
+            elif echo "$MSG" | grep -qE '(^|[[:space:]])fix(\(.+\))?[!]?:'; then
               BUGFIXES="${BUGFIXES}- ${MSG} (${HASH})\n"
-            elif echo "$MSG" | grep -qE '^(ci|cd)(\(.+\))?[!]?:'; then
+            elif echo "$MSG" | grep -qE '(^|[[:space:]])(ci|cd)(\(.+\))?[!]?:'; then
               CICD="${CICD}- ${MSG} (${HASH})\n"
             else
               OTHER="${OTHER}- ${MSG} (${HASH})\n"
@@ -111,11 +111,20 @@ jobs:
             echo "RELEASE_NOTES_EOF"
           } >> "$GITHUB_OUTPUT"
 
+      - name: Update Cargo.toml version
+        run: |
+          NEXT_TAG="${{ steps.version.outputs.next_tag }}"
+          VERSION="${NEXT_TAG#v}"
+          sed -i "s/^version = \".*\"/version = \"${VERSION}\"/" Cargo.toml
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Cargo.toml
+          git commit -m "chore: bump version to ${VERSION}"
+          git push origin HEAD
+
       - name: Create and push tag
         run: |
           NEXT_TAG="${{ steps.version.outputs.next_tag }}"
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
           git tag "$NEXT_TAG"
           git push origin "$NEXT_TAG"
 
