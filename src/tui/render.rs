@@ -284,7 +284,8 @@ impl App {
                         .title(t!(TuiMsg::SelectedRecordTitle))
                         .style(Style::default().fg(Color::Green)),
                 )
-                .style(Style::default().fg(Color::White));
+                .style(Style::default().fg(Color::White))
+                .wrap(ratatui::widgets::Wrap { trim: false });
 
             frame.render_widget(preview_paragraph, chunks[3]);
         } else {
