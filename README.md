@@ -21,8 +21,11 @@ A TUI MySQL client for fast database exploration with fuzzy search, written in R
 
 ```bash
 brew tap hatohato25/sqsh
+brew trust --formula hatohato25/sqsh/sqsh
 brew install sqsh
 ```
+
+> **Note:** `brew trust` is required by Homebrew 4.x and later to explicitly trust third-party tap formulae before installation.
 
 ### Linux / WSL (Windows Subsystem for Linux)
 
