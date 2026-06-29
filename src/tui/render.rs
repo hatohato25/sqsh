@@ -10,7 +10,7 @@ use crate::config::BastionSetting;
 use crate::i18n::TuiMsg;
 use crate::t;
 
-use super::{App, AppState, CompletionState, InputFocus};
+use super::{App, AppState, CompletionState, InputFocus, PromptInputState};
 use crate::completion::CompletionKind;
 
 impl App {
@@ -144,22 +144,44 @@ impl App {
 
     /// 接続済み画面（SQL入力）
     pub(super) fn render_connected(&self, frame: &mut Frame, area: Rect) {
-        // Shell入力エリアを SQL入力エリアと接続情報エリアの間に挿入する
-        // chunks[0]: パンくずリスト
-        // chunks[1]: SQL入力エリア
-        // chunks[2]: Shell入力エリア
-        // chunks[3]: 接続情報・選択レコードプレビュー（has_record に応じて内容を切り替え）
-        // chunks[4]: ヘルプ
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(2), // パンくずリスト
-                Constraint::Length(5), // SQL入力エリア
-                Constraint::Length(5), // Shell入力エリア
-                Constraint::Min(3),    // 接続情報・選択レコードプレビュー
-                Constraint::Length(3), // ヘルプ
-            ])
-            .split(area);
+        // anthropic_api_key の有無でプロンプトエリアの表示を切り替える。
+        // キーが未設定の場合はプロンプトエリアを非表示にし、そのスペースを情報パネルに割り当てる。
+        let has_api_key = self
+            .settings
+            .anthropic_api_key
+            .as_ref()
+            .map(|k| !k.as_str().is_empty())
+            .unwrap_or(false);
+
+        // レイアウトを API キーの有無によって切り替える:
+        // APIキーあり: パンくず + SQL + Shell + Prompt + 情報 + ヘルプ (6段)
+        // APIキーなし: パンくず + SQL + Shell + 情報 + ヘルプ (5段)
+        let (chunks, prompt_chunk_idx, info_chunk_idx, help_chunk_idx) = if has_api_key {
+            let c = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(2), // [0] パンくずリスト
+                    Constraint::Length(5), // [1] SQL入力エリア
+                    Constraint::Length(5), // [2] Shell入力エリア
+                    Constraint::Length(5), // [3] PROMPT 入力エリア
+                    Constraint::Min(3),    // [4] 接続情報・選択レコードプレビュー
+                    Constraint::Length(3), // [5] ヘルプ
+                ])
+                .split(area);
+            (c, Some(3usize), 4usize, 5usize)
+        } else {
+            let c = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(2), // [0] パンくずリスト
+                    Constraint::Length(5), // [1] SQL入力エリア
+                    Constraint::Length(5), // [2] Shell入力エリア
+                    Constraint::Min(3),    // [3] 接続情報・選択レコードプレビュー
+                    Constraint::Length(3), // [4] ヘルプ
+                ])
+                .split(area);
+            (c, None, 3usize, 4usize)
+        };
 
         // パンくずリストを描画する
         if let Some(breadcrumb) = self.breadcrumb_line() {
@@ -226,7 +248,18 @@ impl App {
         );
         frame.render_widget(shell_paragraph, chunks[2]);
 
-        // カーソルを表示（フォーカスに応じて SQL または Shell 入力エリアに描画）
+        // PROMPT 入力エリアを描画する（APIキーが設定されている場合のみ）
+        if let Some(prompt_idx) = prompt_chunk_idx {
+            render_prompt_area(
+                frame,
+                chunks[prompt_idx],
+                &self.prompt,
+                self.input_focus,
+                has_api_key,
+            );
+        }
+
+        // カーソルを表示（フォーカスに応じて SQL / Shell / Prompt 入力エリアに描画）
         match self.input_focus {
             InputFocus::Sql => {
                 // 論理行（\n区切り）と折り返しを両方考慮してカーソル位置を計算する
@@ -254,17 +287,37 @@ impl App {
                     y: chunks[2].y + 1 + cy,
                 });
             }
+            InputFocus::Prompt => {
+                // PROMPT エリア内のカーソル位置を計算する（APIキーなし時はフォーカスが来ないが念のため処理する）
+                if let Some(prompt_idx) = prompt_chunk_idx {
+                    let prompt_inner_width =
+                        chunks[prompt_idx].width.saturating_sub(2).max(1) as usize;
+                    let display_width: usize = self
+                        .prompt
+                        .text
+                        .chars()
+                        .take(self.prompt.cursor_position)
+                        .map(|c| unicode_width::UnicodeWidthChar::width(c).unwrap_or(1))
+                        .sum();
+                    let cx = (display_width % prompt_inner_width) as u16;
+                    let cy = (display_width / prompt_inner_width) as u16;
+                    frame.set_cursor_position(ratatui::layout::Position {
+                        x: chunks[prompt_idx].x + 1 + cx,
+                        y: chunks[prompt_idx].y + 1 + cy,
+                    });
+                }
+            }
         };
 
-        // 接続情報 or 選択レコードプレビュー（chunks[3] に描画）
+        // 接続情報 or 選択レコードプレビュー（info_chunk_idx に描画）
         let manager = match &self.state {
             AppState::Connected { manager } => manager,
             _ => {
                 let empty = Paragraph::new("");
-                frame.render_widget(empty, chunks[3]);
+                frame.render_widget(empty, chunks[info_chunk_idx]);
                 let help =
                     Paragraph::new(t!(TuiMsg::QueryHelp)).style(Style::default().fg(Color::Gray));
-                frame.render_widget(help, chunks[4]);
+                frame.render_widget(help, chunks[help_chunk_idx]);
                 return;
             }
         };
@@ -287,7 +340,7 @@ impl App {
                 .style(Style::default().fg(Color::White))
                 .wrap(ratatui::widgets::Wrap { trim: false });
 
-            frame.render_widget(preview_paragraph, chunks[3]);
+            frame.render_widget(preview_paragraph, chunks[info_chunk_idx]);
         } else {
             // 通常の接続情報表示
             let conn_config = manager.config();
@@ -326,17 +379,17 @@ impl App {
                 )
                 .style(Style::default().fg(Color::Cyan));
 
-            frame.render_widget(info_paragraph, chunks[3]);
+            frame.render_widget(info_paragraph, chunks[info_chunk_idx]);
         }
 
-        // ヘルプ（chunks[4] に描画）
+        // ヘルプ（help_chunk_idx に描画）
         let help_text = t!(TuiMsg::ConnectedHelp);
         let help = Paragraph::new(help_text).style(Style::default().fg(Color::Gray));
 
-        frame.render_widget(help, chunks[4]);
+        frame.render_widget(help, chunks[help_chunk_idx]);
 
         // 補完ポップアップを最後（最上層）に描画する
-        // SQL フォーカス時のみ表示する（Shell フォーカス時は表示しない）
+        // SQL フォーカス時のみ表示する（Shell / Prompt フォーカス時は表示しない）
         if self.input_focus == InputFocus::Sql {
             if let Some(ref comp_state) = self.sql.completion_state {
                 if !comp_state.candidates.is_empty() {
@@ -623,4 +676,106 @@ pub(super) fn render_completion_popup(
     list_state.select(Some(state.selected_index));
 
     frame.render_stateful_widget(list, popup_rect, &mut list_state);
+}
+
+/// braille スピナーのフレーム列
+///
+/// ⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏ の10フレームで1サイクルを構成する。
+/// loading_tick % SPINNER_FRAMES_LOADING.len() でフレームを選択する。
+const SPINNER_FRAMES_LOADING: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+
+/// PROMPT 入力エリアを描画する
+///
+/// - フォーカス時: ボーダーを Cyan で強調する
+/// - `is_processing == true`: タイトルに braille スピナーアニメーションを表示する
+/// - `last_error` が Some: エリア内に赤字でエラーを表示する
+/// - APIキー未設定かつテキスト空: プレースホルダーを薄色で表示する
+pub(super) fn render_prompt_area(
+    frame: &mut Frame,
+    area: Rect,
+    prompt: &PromptInputState,
+    focus: InputFocus,
+    has_api_key: bool,
+) {
+    let is_focused = focus == InputFocus::Prompt;
+
+    // ボーダースタイル: フォーカス時は Cyan で強調する
+    let border_style = if is_focused {
+        Style::default().fg(Color::Cyan)
+    } else {
+        Style::default()
+    };
+
+    // タイトル: エラー > 処理中（スピナー） > フォーカス状態の優先順で変化する
+    // エラーメッセージはタイトルバーに表示し、本文エリアは常に入力テキストに使う
+    let title = if let Some(ref err) = prompt.last_error {
+        format!(" Error: {} ", err)
+    } else if prompt.is_processing {
+        // loading_tick をフレーム数で剰余してスピナー文字を選択する
+        let spinner_char =
+            SPINNER_FRAMES_LOADING[prompt.loading_tick as usize % SPINNER_FRAMES_LOADING.len()];
+        // スピナー文字とベースメッセージを組み合わせてアニメーションタイトルを生成する
+        format!(" {} {} ", spinner_char, t!(TuiMsg::PromptProcessingBase))
+    } else if is_focused {
+        t!(TuiMsg::PromptInputTitleFocused).to_string()
+    } else {
+        t!(TuiMsg::PromptInputTitle).to_string()
+    };
+
+    let title_style = if prompt.last_error.is_some() {
+        Style::default().fg(Color::Red)
+    } else {
+        Style::default()
+    };
+
+    // 本文は常に入力テキストを使う（エラー表示中も入力が見えるようにする）
+    let (content, content_style) =
+        if prompt.text.is_empty() && !has_api_key && prompt.last_error.is_none() {
+            // APIキー未設定かつ未入力のときのみプレースホルダーを表示する
+            (
+                "Set ANTHROPIC_API_KEY env var to use AI prompt",
+                Style::default().fg(Color::DarkGray),
+            )
+        } else {
+            (prompt.text.as_str(), Style::default())
+        };
+
+    let paragraph = Paragraph::new(content)
+        .wrap(Wrap { trim: false })
+        .style(content_style)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(ratatui::text::Span::styled(title, title_style))
+                .border_style(border_style),
+        );
+
+    frame.render_widget(paragraph, area);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_spinner_frames_index_safety() {
+        let frame_count = SPINNER_FRAMES_LOADING.len();
+        // u8::MAX までのインデックスが全てパニックせずアクセスできることを確認する
+        let _ = SPINNER_FRAMES_LOADING[0 % frame_count];
+        let _ = SPINNER_FRAMES_LOADING[(frame_count - 1) % frame_count];
+        let _ = SPINNER_FRAMES_LOADING[u8::MAX as usize % frame_count];
+    }
+
+    #[test]
+    fn test_spinner_frames_count() {
+        assert_eq!(SPINNER_FRAMES_LOADING.len(), 10);
+    }
+
+    #[test]
+    fn test_spinner_frames_cycle() {
+        let frame0 = SPINNER_FRAMES_LOADING[0 % SPINNER_FRAMES_LOADING.len()];
+        let frame1 = SPINNER_FRAMES_LOADING[1 % SPINNER_FRAMES_LOADING.len()];
+        // フレームが切り替わることを確認する
+        assert_ne!(frame0, frame1);
+    }
 }

@@ -48,6 +48,10 @@ pub enum Error {
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 
+    /// Claude API 呼び出しエラー
+    #[error("Claude API error: {0}")]
+    ClaudeApi(String),
+
     /// その他のエラー
     #[error("{0}")]
     Other(String),
@@ -83,6 +87,7 @@ impl Error {
                 let detail = err.to_string();
                 ErrorMsg::Io { detail: &detail }.translate(lang)
             }
+            Error::ClaudeApi(detail) => ErrorMsg::ClaudeApi { detail }.translate(lang),
             Error::Other(detail) => ErrorMsg::Other { detail }.translate(lang),
         }
     }
@@ -250,5 +255,11 @@ mod tests {
         assert_eq!(msg, "Query execution timed out");
         let msg_ja = ErrorMsg::QueryTimeout.translate(Lang::Ja);
         assert_eq!(msg_ja, "クエリの実行がタイムアウトしました");
+    }
+
+    #[test]
+    fn test_error_display_claude_api() {
+        let err = Error::ClaudeApi("request failed".to_string());
+        assert_eq!(err.to_string(), "Claude API error: request failed");
     }
 }

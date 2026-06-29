@@ -493,7 +493,8 @@ pub(super) fn determine_skim_action(
 
 /// SQL入力エリアとShell入力エリアのフォーカス状態
 ///
-/// Tab キーで切り替え可能。Shell フォーカス時は補完ポップアップを表示しない。
+/// Tab キーで Sql → Shell → Prompt → Sql の順に循環する。
+/// APIキー未設定時は Prompt をスキップして Sql → Shell → Sql の2段循環にする。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(super) enum InputFocus {
     /// SQL入力エリア（デフォルト）
@@ -501,6 +502,28 @@ pub(super) enum InputFocus {
     Sql,
     /// Shell入力エリア
     Shell,
+    /// PROMPT入力エリア（Claude AI 連携）
+    Prompt,
+}
+
+/// PROMPT 入力エリアの状態管理
+///
+/// Claude API へのリクエスト状態と入力テキストを管理する。
+#[derive(Debug)]
+pub(super) struct PromptInputState {
+    /// 入力中のプロンプトテキスト
+    pub text: String,
+    /// カーソル位置（char単位）
+    pub cursor_position: usize,
+    /// API リクエスト処理中フラグ
+    pub is_processing: bool,
+    /// 最後のエラーメッセージ（None = エラーなし）
+    pub last_error: Option<String>,
+    /// ローディングアニメーションのフレームカウンター
+    ///
+    /// is_processing が true の間、イベントループのポーリングごとにインクリメントされ、
+    /// 描画時に braille スピナーのフレーム選択に使用する。
+    pub loading_tick: u8,
 }
 
 /// 実行中クエリの管理情報
@@ -716,9 +739,10 @@ pub struct App {
     /// 接続設定の readonly=true との論理和で最終的な判定を行う。
     pub(super) readonly: bool,
 
-    /// SQL/Shell 入力エリアのフォーカス状態
+    /// SQL/Shell/Prompt 入力エリアのフォーカス状態
     ///
-    /// Tab キーで SQL ↔ Shell を切り替える。Shell フォーカス時は補完ポップアップを非表示にする。
+    /// Tab キーで Sql → Shell → Prompt → Sql の順に循環する。
+    /// APIキー未設定時は Prompt をスキップして Sql → Shell → Sql の2段循環にする。
     pub(super) input_focus: InputFocus,
 
     /// SQL入力エリアの状態
@@ -726,6 +750,18 @@ pub struct App {
 
     /// Shell入力エリアの状態
     pub(super) shell: ShellInputState,
+
+    /// アプリケーション設定（anthropic_api_key, claude_model 等）
+    pub(super) settings: crate::config::AppSettings,
+
+    /// PROMPT 入力エリアの状態（テキスト・カーソル・処理中フラグ・エラーなど）
+    pub(super) prompt: PromptInputState,
+
+    /// PROMPT バックグラウンドタスクのハンドル
+    ///
+    /// Enter で claude::run_agent を spawn し、完了時に poll_prompt_completion() で
+    /// 生成 SQL を sql.text に書き込む。
+    pub(super) prompt_task: Option<JoinHandle<crate::error::Result<String>>>,
 }
 
 impl App {
@@ -733,6 +769,8 @@ impl App {
     pub fn new(config: Config, shutdown_flag: Arc<AtomicBool>, cli_readonly: bool) -> Self {
         // default_bastionを適用した接続設定リストを取得
         let connections = config.resolve_connections();
+        // settings は Config から取り出す（anthropic_api_key, claude_model 等を保持）
+        let settings = config.settings;
         Self {
             state: AppState::Selecting {
                 connections,
@@ -750,6 +788,15 @@ impl App {
             input_focus: InputFocus::default(),
             sql: SqlInputState::new(),
             shell: ShellInputState::new(),
+            settings,
+            prompt: PromptInputState {
+                text: String::new(),
+                cursor_position: 0,
+                is_processing: false,
+                last_error: None,
+                loading_tick: 0,
+            },
+            prompt_task: None,
         }
     }
 
@@ -830,6 +877,7 @@ impl App {
     ) -> Result<()> {
         loop {
             self.poll_query_completion().await?;
+            self.poll_prompt_completion().await;
 
             // StreamingQuery状態に遷移した場合、ストリーミングでskimに渡す
             if matches!(self.state, AppState::StreamingQuery { .. }) {
@@ -1054,6 +1102,13 @@ impl App {
                 }
 
                 continue;
+            }
+
+            // AI処理中はローディングアニメーションのカウンターを更新する
+            // ポーリングループ（100ms間隔）ごとにインクリメントすることで
+            // 描画時に braille スピナーのフレームが自然に切り替わる
+            if self.prompt.is_processing {
+                self.prompt.loading_tick = self.prompt.loading_tick.wrapping_add(1);
             }
 
             // 画面描画
@@ -1450,6 +1505,75 @@ impl App {
             running_query.task.abort();
         }
     }
+
+    /// PROMPT バックグラウンドタスクの完了をポーリングして結果を反映する
+    ///
+    /// 完了時に生成 SQL を sql.text に書き込む:
+    /// - 成功時: sql.text に生成 SQL をセットし、フォーカスを Sql に戻す
+    /// - エラー時: prompt.last_error にエラーメッセージをセットする
+    /// - いずれの場合も is_processing = false にリセットする
+    /// - エージェントが内部で実行した SELECT は別接続で完結するため
+    ///   TUI 側のクエリ結果テーブルには影響しない
+    pub(super) async fn poll_prompt_completion(&mut self) {
+        let task_finished = self.prompt_task.as_ref().is_some_and(|t| t.is_finished());
+
+        if !task_finished {
+            return;
+        }
+
+        let Some(task) = self.prompt_task.take() else {
+            return;
+        };
+
+        match task.await {
+            Ok(Ok(sql)) => {
+                tracing::debug!("PROMPT task completed: generated SQL length={}", sql.len());
+                // TUI の SQL 入力エリアは1行表示のため、改行をスペースに変換してワンライナーにする
+                let sql = normalize_sql_to_oneliner(&sql);
+                self.sql.text = sql;
+                self.sql.cursor_position = self.sql.text.chars().count();
+                self.prompt.is_processing = false;
+                self.prompt.last_error = None;
+                // アニメーションを停止するためカウンターをリセットする
+                self.prompt.loading_tick = 0;
+                // 生成 SQL を確認しやすいよう SQL 入力エリアにフォーカスを戻す
+                self.input_focus = InputFocus::Sql;
+            }
+            Ok(Err(e)) => {
+                tracing::error!("PROMPT task failed: {}", e);
+                self.prompt.last_error = Some(e.user_message());
+                self.prompt.is_processing = false;
+                // アニメーションを停止するためカウンターをリセットする
+                self.prompt.loading_tick = 0;
+            }
+            Err(join_error) => {
+                tracing::error!("PROMPT task panicked: {}", join_error);
+                self.prompt.last_error =
+                    Some(format!("タスクが異常終了しました: {}", join_error));
+                self.prompt.is_processing = false;
+                // アニメーションを停止するためカウンターをリセットする
+                self.prompt.loading_tick = 0;
+            }
+        }
+    }
+}
+
+/// SQL 文字列を TUI 入力欄用のワンライナーに正規化する
+///
+/// Claude が生成する SQL には改行や連続スペースが含まれることがあるため、
+/// 1行表示の入力エリアにセットする前にフラットな文字列に変換する。
+/// 変換内容:
+/// 1. `\r\n` / `\r` / `\n` をスペースに置換
+/// 2. 連続するスペースを1つに圧縮
+/// 3. 前後をトリム
+fn normalize_sql_to_oneliner(sql: &str) -> String {
+    // \r\n を先に処理することで \r が二重変換されるのを防ぐ
+    let replaced = sql.replace("\r\n", " ").replace(['\r', '\n'], " ");
+    // 連続スペースを1つに圧縮する
+    replaced
+        .split_ascii_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// SHOW TABLES を実行して結果を Vec<String> で返す
@@ -1591,6 +1715,15 @@ mod tests {
                 history_draft: String::new(),
                 pending_command: None,
             },
+            settings: crate::config::AppSettings::default(),
+            prompt: PromptInputState {
+                text: String::new(),
+                cursor_position: 0,
+                is_processing: false,
+                last_error: None,
+                loading_tick: 0,
+            },
+            prompt_task: None,
         }
     }
 

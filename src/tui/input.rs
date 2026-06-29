@@ -46,18 +46,55 @@ impl App {
         &mut self,
         key_event: event::KeyEvent,
     ) -> Result<()> {
+        // PROMPT フォーカス中は PROMPT 専用ハンドラに委譲する
+        if self.input_focus == InputFocus::Prompt {
+            return self.handle_prompt_input(key_event).await;
+        }
+
         // 補完ポップアップ表示中は専用ハンドラに優先委譲する
         // 補完ハンドラが消費したキーは以降の処理に伝播させない
         if self.sql.completion_state.is_some() && self.handle_completion_key(key_event).await? {
             return Ok(());
         }
 
-        // Tab キー: 補完ポップアップ非表示時のみ SQL/Shell フォーカスを切り替える
-        // 補完表示中は handle_completion_key で既に処理されているため、ここには来ない
+        // APIキーが設定されているかを事前に判定する（フォーカス循環に使用）
+        let has_api_key = self
+            .settings
+            .anthropic_api_key
+            .as_ref()
+            .map(|k| !k.as_str().is_empty())
+            .unwrap_or(false);
+
+        // Tab キー: 補完ポップアップ非表示時のみ SQL/Shell/Prompt フォーカスを切り替える
+        // APIキー未設定時は Prompt をスキップして Sql → Shell → Sql の2段循環にする
         if key_event.code == KeyCode::Tab && self.sql.completion_state.is_none() {
             self.input_focus = match self.input_focus {
                 InputFocus::Sql => InputFocus::Shell,
+                InputFocus::Shell => {
+                    if has_api_key {
+                        InputFocus::Prompt
+                    } else {
+                        InputFocus::Sql
+                    }
+                }
+                InputFocus::Prompt => InputFocus::Sql,
+            };
+            return Ok(());
+        }
+
+        // Shift+Tab: 逆順でフォーカスを循環させる
+        // APIキー未設定時は Prompt をスキップして Sql → Shell → Sql の2段逆循環にする
+        if key_event.code == KeyCode::BackTab && self.sql.completion_state.is_none() {
+            self.input_focus = match self.input_focus {
+                InputFocus::Sql => {
+                    if has_api_key {
+                        InputFocus::Prompt
+                    } else {
+                        InputFocus::Shell
+                    }
+                }
                 InputFocus::Shell => InputFocus::Sql,
+                InputFocus::Prompt => InputFocus::Shell,
             };
             return Ok(());
         }
@@ -839,6 +876,21 @@ impl App {
             KeyCode::Char('c') if key_event.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.should_quit = true;
             }
+            // Tab: Shell → Prompt にフォーカスを進める（Sql → Shell → Prompt → Sql の循環）
+            // APIキー未設定時は Prompt をスキップして Shell → Sql に進める
+            KeyCode::Tab => {
+                let has_api_key = self
+                    .settings
+                    .anthropic_api_key
+                    .as_ref()
+                    .map(|k| !k.as_str().is_empty())
+                    .unwrap_or(false);
+                if has_api_key {
+                    self.input_focus = InputFocus::Prompt;
+                } else {
+                    self.input_focus = InputFocus::Sql;
+                }
+            }
             // ↑: Shell履歴を遡る
             KeyCode::Up => {
                 self.shell_history_prev();
@@ -1021,5 +1073,115 @@ impl App {
             pos += 1;
         }
         pos
+    }
+
+    /// PROMPT 入力エリアのキー入力処理
+    ///
+    /// Enter でバックグラウンドタスクを spawn して Claude API エージェントを起動する。
+    /// is_processing が true の間は Enter と文字入力を無視する。
+    pub(super) async fn handle_prompt_input(&mut self, key_event: event::KeyEvent) -> Result<()> {
+        match key_event.code {
+            // Enter: APIキーが設定されていてかつ未処理の場合のみエージェントを起動する
+            KeyCode::Enter if !self.prompt.is_processing => {
+                let prompt_text = self.prompt.text.trim().to_string();
+                if prompt_text.is_empty() {
+                    return Ok(());
+                }
+
+                // AppState::Connected からプールを取得する（他の状態では何もしない）
+                let pool = match &self.state {
+                    AppState::Connected { manager } => manager.pool().clone(),
+                    _ => return Ok(()),
+                };
+
+                // APIキーは config.toml の settings.anthropic_api_key を優先する
+                // （Config::load() 内で環境変数 ANTHROPIC_API_KEY へのフォールバック済み）
+                // APIキーはログに出力しない
+                let api_key = match self.settings.anthropic_api_key.as_ref() {
+                    Some(key) => key.as_str().to_string(),
+                    None => {
+                        self.prompt.last_error =
+                            Some("ANTHROPIC_API_KEY が設定されていません".to_string());
+                        return Ok(());
+                    }
+                };
+
+                // モデルは config.toml の settings.claude_model を優先する
+                // （Config::load() 内で環境変数 CLAUDE_MODEL へのフォールバック済み）
+                let model = self
+                    .settings
+                    .claude_model
+                    .clone()
+                    .unwrap_or_else(|| "claude-3-5-haiku-20241022".to_string());
+
+                self.prompt.is_processing = true;
+                self.prompt.last_error = None;
+
+                // バックグラウンドタスクを spawn してエージェントを起動する
+                // エージェント内部の SELECT は pool のコピーで実行されるため
+                // TUI のクエリ結果テーブルには影響しない
+                let handle = tokio::spawn(async move {
+                    crate::claude::run_agent(&api_key, &model, &pool, &prompt_text).await
+                });
+                self.prompt_task = Some(handle);
+            }
+            // 処理中は Enter を無視する（上記の guard が false の場合）
+            KeyCode::Enter => {}
+            // Esc: SQL 入力エリアにフォーカスを戻す
+            KeyCode::Esc => {
+                self.input_focus = InputFocus::Sql;
+            }
+            // Tab: PROMPT → Sql にフォーカスを進める（循環）
+            KeyCode::Tab => {
+                self.input_focus = InputFocus::Sql;
+            }
+            // Shift+Tab: PROMPT → Shell に戻る（逆循環）
+            KeyCode::BackTab => {
+                self.input_focus = InputFocus::Shell;
+            }
+            // Ctrl+C: 終了
+            KeyCode::Char('c') if key_event.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.should_quit = true;
+            }
+            // 処理中の場合は文字入力を無視する
+            KeyCode::Char(_) | KeyCode::Backspace if self.prompt.is_processing => {}
+            // 通常の文字入力: プロンプトテキストに挿入する
+            KeyCode::Char(c) => {
+                let byte_pos = self.prompt_char_to_byte(self.prompt.cursor_position);
+                self.prompt.text.insert(byte_pos, c);
+                self.prompt.cursor_position += 1;
+            }
+            // Backspace: カーソル直前の文字を削除する
+            KeyCode::Backspace if self.prompt.cursor_position > 0 => {
+                let byte_pos = self.prompt_char_to_byte(self.prompt.cursor_position - 1);
+                self.prompt.text.remove(byte_pos);
+                self.prompt.cursor_position -= 1;
+            }
+            KeyCode::Backspace => {}
+            // Left: カーソルを左に移動する
+            KeyCode::Left if self.prompt.cursor_position > 0 => {
+                self.prompt.cursor_position -= 1;
+            }
+            KeyCode::Left => {}
+            // Right: カーソルを右に移動する
+            KeyCode::Right => {
+                let char_count = self.prompt.text.chars().count();
+                if self.prompt.cursor_position < char_count {
+                    self.prompt.cursor_position += 1;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// prompt.text の char 位置をバイト位置に変換する
+    pub(super) fn prompt_char_to_byte(&self, char_pos: usize) -> usize {
+        self.prompt
+            .text
+            .char_indices()
+            .nth(char_pos)
+            .map(|(i, _)| i)
+            .unwrap_or(self.prompt.text.len())
     }
 }
