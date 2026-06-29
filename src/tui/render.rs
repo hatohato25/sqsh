@@ -244,7 +244,7 @@ impl App {
         let shell_inner_width = chunks[2].width.saturating_sub(2).max(1);
         let shell_text = build_multiline_text(
             &self.shell.text,
-            None,
+            self.shell.selection_start,
             self.shell.cursor_position,
             shell_inner_width,
         );
@@ -788,7 +788,7 @@ pub(super) fn render_prompt_area(
         let prompt_inner_width = area.width.saturating_sub(2).max(1);
         let text = build_multiline_text(
             &prompt.text,
-            None,
+            prompt.selection_start,
             prompt.cursor_position,
             prompt_inner_width,
         );

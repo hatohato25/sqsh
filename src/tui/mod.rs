@@ -515,6 +515,15 @@ pub(super) struct PromptInputState {
     pub text: String,
     /// カーソル位置（char単位）
     pub cursor_position: usize,
+    /// テキスト選択開始位置（char単位、None=選択なし）
+    ///
+    /// Shift+矢印キーで選択範囲を設定する。cursor_positionと組み合わせて
+    /// min(selection_start, cursor_position)..max(selection_start, cursor_position) が選択範囲となる。
+    pub selection_start: Option<usize>,
+    /// Ctrl+K / Ctrl+U で削除したテキストを保存するキルバッファ
+    ///
+    /// Ctrl+Y（yank）でペースト可能。システムクリップボードとは独立している。
+    pub kill_buffer: String,
     /// API リクエスト処理中フラグ
     pub is_processing: bool,
     /// 最後のエラーメッセージ（None = エラーなし）
@@ -652,6 +661,15 @@ pub(super) struct ShellInputState {
     pub text: String,
     /// カーソル位置（char単位）
     pub cursor_position: usize,
+    /// テキスト選択開始位置（char単位、None=選択なし）
+    ///
+    /// Shift+矢印キーで選択範囲を設定する。cursor_positionと組み合わせて
+    /// min(selection_start, cursor_position)..max(selection_start, cursor_position) が選択範囲となる。
+    pub selection_start: Option<usize>,
+    /// Ctrl+K / Ctrl+U で削除したテキストを保存するキルバッファ
+    ///
+    /// Ctrl+Y（yank）でペースト可能。システムクリップボードとは独立している。
+    pub kill_buffer: String,
     /// Shell実行履歴（最新が末尾）
     ///
     /// MAX_SQL_HISTORY と同じ上限を使用する。
@@ -674,6 +692,8 @@ impl ShellInputState {
         Self {
             text: String::new(),
             cursor_position: 0,
+            selection_start: None,
+            kill_buffer: String::new(),
             history: VecDeque::new(),
             history_index: None,
             history_draft: String::new(),
@@ -792,6 +812,8 @@ impl App {
             prompt: PromptInputState {
                 text: String::new(),
                 cursor_position: 0,
+                selection_start: None,
+                kill_buffer: String::new(),
                 is_processing: false,
                 last_error: None,
                 loading_tick: 0,
@@ -1710,6 +1732,8 @@ mod tests {
             shell: ShellInputState {
                 text: String::new(),
                 cursor_position: 0,
+                selection_start: None,
+                kill_buffer: String::new(),
                 history: std::collections::VecDeque::new(),
                 history_index: None,
                 history_draft: String::new(),
@@ -1719,6 +1743,8 @@ mod tests {
             prompt: PromptInputState {
                 text: String::new(),
                 cursor_position: 0,
+                selection_start: None,
+                kill_buffer: String::new(),
                 is_processing: false,
                 last_error: None,
                 loading_tick: 0,
