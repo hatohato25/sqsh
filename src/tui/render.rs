@@ -741,9 +741,9 @@ pub(super) fn render_prompt_area(
 ) {
     let is_focused = focus == InputFocus::Prompt;
 
-    // ボーダースタイル: フォーカス時は Cyan で強調する
+    // ボーダースタイル: SQL/Shell入力エリアと統一し、フォーカス時は Yellow で強調する
     let border_style = if is_focused {
-        Style::default().fg(Color::Cyan)
+        Style::default().fg(Color::Yellow)
     } else {
         Style::default()
     };

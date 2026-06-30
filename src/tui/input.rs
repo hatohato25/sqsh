@@ -870,9 +870,50 @@ impl App {
             KeyCode::Enter if !self.shell.text.trim().is_empty() => {
                 self.execute_shell_command();
             }
-            // Ctrl+C: 終了
+            // Ctrl+C: 選択範囲をクリップボードにコピー（選択なしの場合は終了）
             KeyCode::Char('c') if key_event.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.should_quit = true;
+                if let Some((byte_start, byte_end)) = self.shell_selection_byte_range() {
+                    let selected_text = &self.shell.text[byte_start..byte_end];
+                    if let Ok(mut clipboard) = arboard::Clipboard::new() {
+                        let _ = clipboard.set_text(selected_text.to_string());
+                    }
+                    // コピー後は選択解除
+                    self.shell.selection_start = None;
+                } else {
+                    // 選択範囲がない場合は従来のCtrl+C動作（終了）
+                    self.should_quit = true;
+                }
+            }
+            // Ctrl+X: 選択範囲をカット
+            KeyCode::Char('x') if key_event.modifiers.contains(KeyModifiers::CONTROL) => {
+                if let Some((byte_start, byte_end)) = self.shell_selection_byte_range() {
+                    let selected_text = self.shell.text[byte_start..byte_end].to_string();
+                    if let Ok(mut clipboard) = arboard::Clipboard::new() {
+                        let _ = clipboard.set_text(selected_text);
+                    }
+                    // 選択範囲を削除してカーソルを選択開始位置に移動
+                    let cursor_start = self
+                        .shell
+                        .selection_start
+                        .unwrap_or(self.shell.cursor_position)
+                        .min(self.shell.cursor_position);
+                    self.shell.text.replace_range(byte_start..byte_end, "");
+                    self.shell.cursor_position = cursor_start;
+                    self.shell.selection_start = None;
+                }
+            }
+            // Ctrl+V: クリップボードからペースト
+            KeyCode::Char('v') if key_event.modifiers.contains(KeyModifiers::CONTROL) => {
+                // 選択範囲があれば先に削除（上書きペースト）
+                self.delete_shell_selection();
+                if let Ok(mut clipboard) = arboard::Clipboard::new() {
+                    if let Ok(text) = clipboard.get_text() {
+                        let sanitized = text.replace('\r', "");
+                        let byte_pos = self.shell_char_to_byte(self.shell.cursor_position);
+                        self.shell.text.insert_str(byte_pos, &sanitized);
+                        self.shell.cursor_position += sanitized.chars().count();
+                    }
+                }
             }
             // Tab: Shell → Prompt にフォーカスを進める（Sql → Shell → Prompt → Sql の循環）
             // APIキー未設定時は Prompt をスキップして Shell → Sql に進める
@@ -1244,9 +1285,12 @@ impl App {
     pub(super) async fn handle_prompt_input(&mut self, key_event: event::KeyEvent) -> Result<()> {
         // --- 処理中でも動作する制御キー ---
         match key_event.code {
-            // Esc: SQL 入力エリアにフォーカスを戻す
+            // Esc: AIプロンプト入力をクリアする（SQL/Shell入力と操作を統一）
+            // フォーカス移動は Tab/Shift+Tab が担うため、Esc はクリア専用とする
             KeyCode::Esc => {
-                self.input_focus = InputFocus::Sql;
+                self.prompt.text.clear();
+                self.prompt.cursor_position = 0;
+                self.prompt.selection_start = None;
                 return Ok(());
             }
             // Tab: PROMPT → Sql にフォーカスを進める（循環）
@@ -1259,9 +1303,19 @@ impl App {
                 self.input_focus = InputFocus::Shell;
                 return Ok(());
             }
-            // Ctrl+C: 終了
+            // Ctrl+C: 選択範囲をクリップボードにコピー（選択なしの場合は終了）
             KeyCode::Char('c') if key_event.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.should_quit = true;
+                if let Some((byte_start, byte_end)) = self.prompt_selection_byte_range() {
+                    let selected_text = &self.prompt.text[byte_start..byte_end];
+                    if let Ok(mut clipboard) = arboard::Clipboard::new() {
+                        let _ = clipboard.set_text(selected_text.to_string());
+                    }
+                    // コピー後は選択解除
+                    self.prompt.selection_start = None;
+                } else {
+                    // 選択範囲がない場合は従来のCtrl+C動作（終了）
+                    self.should_quit = true;
+                }
                 return Ok(());
             }
             // Enter: APIキーが設定されていてかつ未処理の場合のみエージェントを起動する
@@ -1323,6 +1377,37 @@ impl App {
 
         // --- 編集系キー ---
         match key_event.code {
+            // Ctrl+X: 選択範囲をカット
+            KeyCode::Char('x') if key_event.modifiers.contains(KeyModifiers::CONTROL) => {
+                if let Some((byte_start, byte_end)) = self.prompt_selection_byte_range() {
+                    let selected_text = self.prompt.text[byte_start..byte_end].to_string();
+                    if let Ok(mut clipboard) = arboard::Clipboard::new() {
+                        let _ = clipboard.set_text(selected_text);
+                    }
+                    // 選択範囲を削除してカーソルを選択開始位置に移動
+                    let cursor_start = self
+                        .prompt
+                        .selection_start
+                        .unwrap_or(self.prompt.cursor_position)
+                        .min(self.prompt.cursor_position);
+                    self.prompt.text.replace_range(byte_start..byte_end, "");
+                    self.prompt.cursor_position = cursor_start;
+                    self.prompt.selection_start = None;
+                }
+            }
+            // Ctrl+V: クリップボードからペースト
+            KeyCode::Char('v') if key_event.modifiers.contains(KeyModifiers::CONTROL) => {
+                // 選択範囲があれば先に削除（上書きペースト）
+                self.delete_prompt_selection();
+                if let Ok(mut clipboard) = arboard::Clipboard::new() {
+                    if let Ok(text) = clipboard.get_text() {
+                        let sanitized = text.replace('\r', "");
+                        let byte_pos = self.prompt_char_to_byte(self.prompt.cursor_position);
+                        self.prompt.text.insert_str(byte_pos, &sanitized);
+                        self.prompt.cursor_position += sanitized.chars().count();
+                    }
+                }
+            }
             // Ctrl+A: 全選択（行頭を選択開始点にしてカーソルを末尾へ）
             KeyCode::Char('a') if key_event.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.prompt.selection_start = Some(0);
