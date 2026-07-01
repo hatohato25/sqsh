@@ -52,14 +52,26 @@ pub(crate) fn convert_value_to_string(
                 .map(|v| v.to_string())
                 .or_else(|_| row.try_get::<u64, _>(index).map(|v| v.to_string()))
                 .unwrap_or_else(|_| String::from("NULL"))
-        } else if type_name.starts_with("FLOAT")
-            || type_name.starts_with("DOUBLE")
-            || type_name.starts_with("DECIMAL")
-        {
+        } else if type_name.starts_with("FLOAT") || type_name.starts_with("DOUBLE") {
             // 浮動小数点型（UNSIGNED含む、精度付き含む）
             row.try_get::<f64, _>(index)
                 .map(|v| v.to_string())
                 .unwrap_or_else(|_| String::from("NULL"))
+        } else if type_name.starts_with("DECIMAL") || type_name.starts_with("NUMERIC") {
+            // DECIMAL/NUMERIC型: MySQLでは NUMERIC は DECIMAL の同義語。
+            // sqlx の String::compatible() は DECIMAL カラムタイプ(NewDecimal/Decimal)を拒否するため、
+            // try_get::<String, _>() は型不一致エラーになる。
+            // DECIMAL はバイナリプロトコルで length-encoded な UTF-8 テキストとして格納されるため、
+            // try_get_unchecked で型チェックをバイパスして String としてデコードできる。
+            // sqlx の String::compatible() は DECIMAL/NEWDECIMAL 型を拒否するため、
+            // try_get では型チェックで弾かれる。try_get_unchecked で型チェックをバイパスして
+            // バイナリプロトコルの length-encoded UTF-8 テキストとして直接デコードする。
+            row.try_get_unchecked::<String, _>(index)
+                .unwrap_or_else(|_| {
+                    row.try_get_unchecked::<f64, _>(index)
+                        .map(|v| v.to_string())
+                        .unwrap_or_else(|_| String::from("NULL"))
+                })
         } else if type_name == "VARCHAR"
             || type_name == "CHAR"
             || type_name.starts_with("TEXT")
@@ -107,6 +119,8 @@ pub(crate) fn convert_value_to_string(
             || type_name == "TINYBLOB"
             || type_name == "MEDIUMBLOB"
             || type_name == "LONGBLOB"
+            || type_name == "BINARY"
+            || type_name.starts_with("VARBINARY")
         {
             // バイナリ型は表示しない
             String::from("[BLOB]")
@@ -435,6 +449,105 @@ pub async fn execute_query(
     );
 
     Ok(result)
+}
+
+/// SQLの先頭コメント（`/* ... */` および `-- ...`）を読み飛ばし、最初の意味あるトークンを返す
+///
+/// claude.rs の is_write_sql から呼び出す。
+fn first_meaningful_token_for_write_check(sql: &str) -> &str {
+    let mut s = sql.trim();
+    loop {
+        if s.starts_with("/*") {
+            if let Some(end) = s.find("*/") {
+                s = s[end + 2..].trim_start();
+            } else {
+                return "";
+            }
+        } else if s.starts_with("--") {
+            if let Some(newline) = s.find('\n') {
+                s = s[newline + 1..].trim_start();
+            } else {
+                return "";
+            }
+        } else {
+            break;
+        }
+    }
+    s.split_whitespace().next().unwrap_or("")
+}
+
+/// CTE（WITH句）の後に続くSQL本体が書き込みDMLかどうかを判定する
+///
+/// WITH句のCTE定義を括弧のネストで追跡し、全CTE定義の終了後の先頭トークンを確認する。
+/// 複数CTEのカンマ区切り（`WITH a AS (...), b AS (...)`）にも対応する。
+fn cte_contains_write_op(sql: &str) -> bool {
+    let upper = sql.to_uppercase();
+    let write_keywords = ["INSERT", "UPDATE", "DELETE"];
+
+    let start = match upper.find("WITH") {
+        Some(pos) => pos + 4,
+        None => return false,
+    };
+
+    let bytes = upper.as_bytes();
+    let len = bytes.len();
+    let mut depth = 0i32;
+    let mut i = start;
+
+    while i < len {
+        match bytes[i] {
+            b'(' => {
+                depth += 1;
+                i += 1;
+            }
+            b')' => {
+                depth -= 1;
+                i += 1;
+                if depth == 0 {
+                    let remaining = upper[i..].trim_start();
+                    if remaining.starts_with(',') {
+                        i += upper[i..].len() - remaining.len() + 1;
+                        continue;
+                    }
+                    let token = remaining.split_whitespace().next().unwrap_or("");
+                    return write_keywords.contains(&token);
+                }
+            }
+            _ => {
+                i += 1;
+            }
+        }
+    }
+
+    false
+}
+
+/// 書き込み系SQLかどうかを判定する（claude.rs から使用）
+///
+/// readonlyモードでブロックすべきSQL文の先頭トークンをチェックする。
+/// サーバー側でもブロックされるが、エージェントコンテキストでの即時フィードバックのためクライアントでも検査する。
+/// コメント（`/* */` ブロック・`--` 行）を読み飛ばし、CTE（WITH句）も正しく判定する。
+pub fn is_write_sql(sql: &str) -> bool {
+    let first_token = first_meaningful_token_for_write_check(sql).to_uppercase();
+
+    if first_token == "WITH" {
+        return cte_contains_write_op(sql);
+    }
+
+    matches!(
+        first_token.as_str(),
+        "INSERT"
+            | "UPDATE"
+            | "DELETE"
+            | "DROP"
+            | "ALTER"
+            | "TRUNCATE"
+            | "CREATE"
+            | "REPLACE"
+            | "RENAME"
+            | "GRANT"
+            | "REVOKE"
+    )
 }
 
 /// クエリ実行（タイムアウト付き）

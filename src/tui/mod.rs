@@ -493,7 +493,8 @@ pub(super) fn determine_skim_action(
 
 /// SQL入力エリアとShell入力エリアのフォーカス状態
 ///
-/// Tab キーで切り替え可能。Shell フォーカス時は補完ポップアップを表示しない。
+/// Tab キーで Sql → Shell → Prompt → Sql の順に循環する。
+/// APIキー未設定時は Prompt をスキップして Sql → Shell → Sql の2段循環にする。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(super) enum InputFocus {
     /// SQL入力エリア（デフォルト）
@@ -501,6 +502,37 @@ pub(super) enum InputFocus {
     Sql,
     /// Shell入力エリア
     Shell,
+    /// PROMPT入力エリア（Claude AI 連携）
+    Prompt,
+}
+
+/// PROMPT 入力エリアの状態管理
+///
+/// Claude API へのリクエスト状態と入力テキストを管理する。
+#[derive(Debug)]
+pub(super) struct PromptInputState {
+    /// 入力中のプロンプトテキスト
+    pub text: String,
+    /// カーソル位置（char単位）
+    pub cursor_position: usize,
+    /// テキスト選択開始位置（char単位、None=選択なし）
+    ///
+    /// Shift+矢印キーで選択範囲を設定する。cursor_positionと組み合わせて
+    /// min(selection_start, cursor_position)..max(selection_start, cursor_position) が選択範囲となる。
+    pub selection_start: Option<usize>,
+    /// Ctrl+K / Ctrl+U で削除したテキストを保存するキルバッファ
+    ///
+    /// Ctrl+Y（yank）でペースト可能。システムクリップボードとは独立している。
+    pub kill_buffer: String,
+    /// API リクエスト処理中フラグ
+    pub is_processing: bool,
+    /// 最後のエラーメッセージ（None = エラーなし）
+    pub last_error: Option<String>,
+    /// ローディングアニメーションのフレームカウンター
+    ///
+    /// is_processing が true の間、イベントループのポーリングごとにインクリメントされ、
+    /// 描画時に braille スピナーのフレーム選択に使用する。
+    pub loading_tick: u8,
 }
 
 /// 実行中クエリの管理情報
@@ -629,6 +661,15 @@ pub(super) struct ShellInputState {
     pub text: String,
     /// カーソル位置（char単位）
     pub cursor_position: usize,
+    /// テキスト選択開始位置（char単位、None=選択なし）
+    ///
+    /// Shift+矢印キーで選択範囲を設定する。cursor_positionと組み合わせて
+    /// min(selection_start, cursor_position)..max(selection_start, cursor_position) が選択範囲となる。
+    pub selection_start: Option<usize>,
+    /// Ctrl+K / Ctrl+U で削除したテキストを保存するキルバッファ
+    ///
+    /// Ctrl+Y（yank）でペースト可能。システムクリップボードとは独立している。
+    pub kill_buffer: String,
     /// Shell実行履歴（最新が末尾）
     ///
     /// MAX_SQL_HISTORY と同じ上限を使用する。
@@ -651,6 +692,8 @@ impl ShellInputState {
         Self {
             text: String::new(),
             cursor_position: 0,
+            selection_start: None,
+            kill_buffer: String::new(),
             history: VecDeque::new(),
             history_index: None,
             history_draft: String::new(),
@@ -716,9 +759,10 @@ pub struct App {
     /// 接続設定の readonly=true との論理和で最終的な判定を行う。
     pub(super) readonly: bool,
 
-    /// SQL/Shell 入力エリアのフォーカス状態
+    /// SQL/Shell/Prompt 入力エリアのフォーカス状態
     ///
-    /// Tab キーで SQL ↔ Shell を切り替える。Shell フォーカス時は補完ポップアップを非表示にする。
+    /// Tab キーで Sql → Shell → Prompt → Sql の順に循環する。
+    /// APIキー未設定時は Prompt をスキップして Sql → Shell → Sql の2段循環にする。
     pub(super) input_focus: InputFocus,
 
     /// SQL入力エリアの状態
@@ -726,6 +770,18 @@ pub struct App {
 
     /// Shell入力エリアの状態
     pub(super) shell: ShellInputState,
+
+    /// アプリケーション設定（anthropic_api_key, claude_model 等）
+    pub(super) settings: crate::config::AppSettings,
+
+    /// PROMPT 入力エリアの状態（テキスト・カーソル・処理中フラグ・エラーなど）
+    pub(super) prompt: PromptInputState,
+
+    /// PROMPT バックグラウンドタスクのハンドル
+    ///
+    /// Enter で claude::run_agent を spawn し、完了時に poll_prompt_completion() で
+    /// 生成 SQL を sql.text に書き込む。
+    pub(super) prompt_task: Option<JoinHandle<crate::error::Result<String>>>,
 }
 
 impl App {
@@ -733,6 +789,8 @@ impl App {
     pub fn new(config: Config, shutdown_flag: Arc<AtomicBool>, cli_readonly: bool) -> Self {
         // default_bastionを適用した接続設定リストを取得
         let connections = config.resolve_connections();
+        // settings は Config から取り出す（anthropic_api_key, claude_model 等を保持）
+        let settings = config.settings;
         Self {
             state: AppState::Selecting {
                 connections,
@@ -750,6 +808,17 @@ impl App {
             input_focus: InputFocus::default(),
             sql: SqlInputState::new(),
             shell: ShellInputState::new(),
+            settings,
+            prompt: PromptInputState {
+                text: String::new(),
+                cursor_position: 0,
+                selection_start: None,
+                kill_buffer: String::new(),
+                is_processing: false,
+                last_error: None,
+                loading_tick: 0,
+            },
+            prompt_task: None,
         }
     }
 
@@ -830,6 +899,7 @@ impl App {
     ) -> Result<()> {
         loop {
             self.poll_query_completion().await?;
+            self.poll_prompt_completion().await;
 
             // StreamingQuery状態に遷移した場合、ストリーミングでskimに渡す
             if matches!(self.state, AppState::StreamingQuery { .. }) {
@@ -1054,6 +1124,13 @@ impl App {
                 }
 
                 continue;
+            }
+
+            // AI処理中はローディングアニメーションのカウンターを更新する
+            // ポーリングループ（100ms間隔）ごとにインクリメントすることで
+            // 描画時に braille スピナーのフレームが自然に切り替わる
+            if self.prompt.is_processing {
+                self.prompt.loading_tick = self.prompt.loading_tick.wrapping_add(1);
             }
 
             // 画面描画
@@ -1450,6 +1527,75 @@ impl App {
             running_query.task.abort();
         }
     }
+
+    /// PROMPT バックグラウンドタスクの完了をポーリングして結果を反映する
+    ///
+    /// 完了時に生成 SQL を sql.text に書き込む:
+    /// - 成功時: sql.text に生成 SQL をセットし、フォーカスを Sql に戻す
+    /// - エラー時: prompt.last_error にエラーメッセージをセットする
+    /// - いずれの場合も is_processing = false にリセットする
+    /// - エージェントが内部で実行した SELECT は別接続で完結するため
+    ///   TUI 側のクエリ結果テーブルには影響しない
+    pub(super) async fn poll_prompt_completion(&mut self) {
+        let task_finished = self.prompt_task.as_ref().is_some_and(|t| t.is_finished());
+
+        if !task_finished {
+            return;
+        }
+
+        let Some(task) = self.prompt_task.take() else {
+            return;
+        };
+
+        match task.await {
+            Ok(Ok(sql)) => {
+                tracing::debug!("PROMPT task completed: generated SQL length={}", sql.len());
+                // TUI の SQL 入力エリアは1行表示のため、改行をスペースに変換してワンライナーにする
+                let sql = normalize_sql_to_oneliner(&sql);
+                self.sql.text = sql;
+                self.sql.cursor_position = self.sql.text.chars().count();
+                self.prompt.is_processing = false;
+                self.prompt.last_error = None;
+                // アニメーションを停止するためカウンターをリセットする
+                self.prompt.loading_tick = 0;
+                // 生成 SQL を確認しやすいよう SQL 入力エリアにフォーカスを戻す
+                self.input_focus = InputFocus::Sql;
+            }
+            Ok(Err(e)) => {
+                tracing::error!("PROMPT task failed: {}", e);
+                self.prompt.last_error = Some(e.user_message());
+                self.prompt.is_processing = false;
+                // アニメーションを停止するためカウンターをリセットする
+                self.prompt.loading_tick = 0;
+            }
+            Err(join_error) => {
+                tracing::error!("PROMPT task panicked: {}", join_error);
+                self.prompt.last_error =
+                    Some(format!("タスクが異常終了しました: {}", join_error));
+                self.prompt.is_processing = false;
+                // アニメーションを停止するためカウンターをリセットする
+                self.prompt.loading_tick = 0;
+            }
+        }
+    }
+}
+
+/// SQL 文字列を TUI 入力欄用のワンライナーに正規化する
+///
+/// Claude が生成する SQL には改行や連続スペースが含まれることがあるため、
+/// 1行表示の入力エリアにセットする前にフラットな文字列に変換する。
+/// 変換内容:
+/// 1. `\r\n` / `\r` / `\n` をスペースに置換
+/// 2. 連続するスペースを1つに圧縮
+/// 3. 前後をトリム
+fn normalize_sql_to_oneliner(sql: &str) -> String {
+    // \r\n を先に処理することで \r が二重変換されるのを防ぐ
+    let replaced = sql.replace("\r\n", " ").replace(['\r', '\n'], " ");
+    // 連続スペースを1つに圧縮する
+    replaced
+        .split_ascii_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// SHOW TABLES を実行して結果を Vec<String> で返す
@@ -1586,11 +1732,24 @@ mod tests {
             shell: ShellInputState {
                 text: String::new(),
                 cursor_position: 0,
+                selection_start: None,
+                kill_buffer: String::new(),
                 history: std::collections::VecDeque::new(),
                 history_index: None,
                 history_draft: String::new(),
                 pending_command: None,
             },
+            settings: crate::config::AppSettings::default(),
+            prompt: PromptInputState {
+                text: String::new(),
+                cursor_position: 0,
+                selection_start: None,
+                kill_buffer: String::new(),
+                is_processing: false,
+                last_error: None,
+                loading_tick: 0,
+            },
+            prompt_task: None,
         }
     }
 
@@ -1760,6 +1919,337 @@ mod tests {
         assert_eq!(app.shell.cursor_position, 1);
     }
 
+    // ============================================================
+    // Shell入力の選択・編集機能テスト
+    // ============================================================
+
+    #[tokio::test]
+    async fn test_shell_shift_right_sets_selection() {
+        // 選択なし状態で Shift+Right を押すと現在位置が anchor になり右に伸びることを確認する
+        use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+        let mut app = make_app_with_input("");
+        app.input_focus = InputFocus::Shell;
+        app.shell.text = "ls -la".to_string();
+        app.shell.cursor_position = 3;
+
+        let ev = KeyEvent {
+            code: KeyCode::Right,
+            modifiers: KeyModifiers::SHIFT,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        };
+        app.handle_connected_input(ev).await.unwrap();
+        assert_eq!(app.shell.selection_start, Some(3));
+        assert_eq!(app.shell.cursor_position, 4);
+    }
+
+    #[tokio::test]
+    async fn test_shell_shift_left_sets_selection() {
+        // 選択なし状態で Shift+Left を押すと現在位置が anchor になり左に伸びることを確認する
+        use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+        let mut app = make_app_with_input("");
+        app.input_focus = InputFocus::Shell;
+        app.shell.text = "ls -la".to_string();
+        app.shell.cursor_position = 4;
+
+        let ev = KeyEvent {
+            code: KeyCode::Left,
+            modifiers: KeyModifiers::SHIFT,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        };
+        app.handle_connected_input(ev).await.unwrap();
+        assert_eq!(app.shell.selection_start, Some(4));
+        assert_eq!(app.shell.cursor_position, 3);
+    }
+
+    #[tokio::test]
+    async fn test_shell_shift_home_selects_to_beginning() {
+        // Shift+Home でカーソル位置を anchor として行頭まで選択されることを確認する
+        use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+        let mut app = make_app_with_input("");
+        app.input_focus = InputFocus::Shell;
+        app.shell.text = "ls -la".to_string();
+        app.shell.cursor_position = 4;
+
+        let ev = KeyEvent {
+            code: KeyCode::Home,
+            modifiers: KeyModifiers::SHIFT,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        };
+        app.handle_connected_input(ev).await.unwrap();
+        assert_eq!(app.shell.selection_start, Some(4));
+        assert_eq!(app.shell.cursor_position, 0);
+    }
+
+    #[tokio::test]
+    async fn test_shell_shift_end_selects_to_end() {
+        // Shift+End でカーソル位置を anchor として行末まで選択されることを確認する
+        use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+        let mut app = make_app_with_input("");
+        app.input_focus = InputFocus::Shell;
+        app.shell.text = "ls -la".to_string();
+        app.shell.cursor_position = 2;
+
+        let ev = KeyEvent {
+            code: KeyCode::End,
+            modifiers: KeyModifiers::SHIFT,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        };
+        app.handle_connected_input(ev).await.unwrap();
+        assert_eq!(app.shell.selection_start, Some(2));
+        assert_eq!(app.shell.cursor_position, 6);
+    }
+
+    #[tokio::test]
+    async fn test_shell_left_clears_selection() {
+        // 選択中に通常の Left を押すと選択が解除されることを確認する
+        use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+        let mut app = make_app_with_input("");
+        app.input_focus = InputFocus::Shell;
+        app.shell.text = "ls -la".to_string();
+        app.shell.cursor_position = 4;
+        app.shell.selection_start = Some(2);
+
+        let ev = KeyEvent {
+            code: KeyCode::Left,
+            modifiers: KeyModifiers::NONE,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        };
+        app.handle_connected_input(ev).await.unwrap();
+        assert_eq!(app.shell.selection_start, None);
+        assert_eq!(app.shell.cursor_position, 3);
+    }
+
+    #[tokio::test]
+    async fn test_shell_right_clears_selection() {
+        // 選択中に通常の Right を押すと選択が解除されることを確認する
+        use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+        let mut app = make_app_with_input("");
+        app.input_focus = InputFocus::Shell;
+        app.shell.text = "ls -la".to_string();
+        app.shell.cursor_position = 2;
+        app.shell.selection_start = Some(4);
+
+        let ev = KeyEvent {
+            code: KeyCode::Right,
+            modifiers: KeyModifiers::NONE,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        };
+        app.handle_connected_input(ev).await.unwrap();
+        assert_eq!(app.shell.selection_start, None);
+        assert_eq!(app.shell.cursor_position, 3);
+    }
+
+    #[tokio::test]
+    async fn test_shell_char_replaces_selection() {
+        // 選択範囲がある状態で文字を入力すると選択範囲が置換されることを確認する
+        use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+        let mut app = make_app_with_input("");
+        app.input_focus = InputFocus::Shell;
+        app.shell.text = "hello world".to_string();
+        app.shell.cursor_position = 5;
+        app.shell.selection_start = Some(0); // "hello" を選択
+
+        let ev = KeyEvent {
+            code: KeyCode::Char('X'),
+            modifiers: KeyModifiers::NONE,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        };
+        app.handle_connected_input(ev).await.unwrap();
+        assert_eq!(app.shell.text, "X world");
+        assert_eq!(app.shell.cursor_position, 1);
+        assert_eq!(app.shell.selection_start, None);
+    }
+
+    #[tokio::test]
+    async fn test_shell_backspace_deletes_selection() {
+        // 選択範囲がある状態で Backspace を押すと選択範囲全体が削除されることを確認する
+        use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+        let mut app = make_app_with_input("");
+        app.input_focus = InputFocus::Shell;
+        app.shell.text = "hello world".to_string();
+        app.shell.cursor_position = 5;
+        app.shell.selection_start = Some(0); // "hello" を選択
+
+        let ev = KeyEvent {
+            code: KeyCode::Backspace,
+            modifiers: KeyModifiers::NONE,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        };
+        app.handle_connected_input(ev).await.unwrap();
+        assert_eq!(app.shell.text, " world");
+        assert_eq!(app.shell.cursor_position, 0);
+        assert_eq!(app.shell.selection_start, None);
+    }
+
+    #[tokio::test]
+    async fn test_shell_delete_deletes_selection() {
+        // 選択範囲がある状態で Delete を押すと選択範囲全体が削除されることを確認する
+        use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+        let mut app = make_app_with_input("");
+        app.input_focus = InputFocus::Shell;
+        // cursor(11)が末尾, selection_start(6)が'w'の手前 → "world" を選択
+        app.shell.text = "hello world".to_string();
+        app.shell.cursor_position = 11;
+        app.shell.selection_start = Some(6);
+
+        let ev = KeyEvent {
+            code: KeyCode::Delete,
+            modifiers: KeyModifiers::NONE,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        };
+        app.handle_connected_input(ev).await.unwrap();
+        assert_eq!(app.shell.text, "hello ");
+        assert_eq!(app.shell.cursor_position, 6);
+        assert_eq!(app.shell.selection_start, None);
+    }
+
+    #[tokio::test]
+    async fn test_shell_ctrl_k_kill_and_yank() {
+        // Ctrl+K でカーソル以降が kill_buffer に保存され、Ctrl+Y で元の位置に挿入されることを確認する
+        use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+        let mut app = make_app_with_input("");
+        app.input_focus = InputFocus::Shell;
+        app.shell.text = "ls -la".to_string();
+        app.shell.cursor_position = 3;
+
+        let ev_k = KeyEvent {
+            code: KeyCode::Char('k'),
+            modifiers: KeyModifiers::CONTROL,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        };
+        app.handle_connected_input(ev_k).await.unwrap();
+        assert_eq!(app.shell.text, "ls ");
+        assert_eq!(app.shell.cursor_position, 3);
+        assert_eq!(app.shell.kill_buffer, "-la");
+
+        // Ctrl+Y で kill_buffer の内容をペーストする
+        let ev_y = KeyEvent {
+            code: KeyCode::Char('y'),
+            modifiers: KeyModifiers::CONTROL,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        };
+        app.handle_connected_input(ev_y).await.unwrap();
+        assert_eq!(app.shell.text, "ls -la");
+        assert_eq!(app.shell.cursor_position, 6);
+    }
+
+    #[tokio::test]
+    async fn test_shell_ctrl_u_kills_before_cursor() {
+        // Ctrl+U でカーソル以前のテキストが kill_buffer に保存されることを確認する
+        use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+        let mut app = make_app_with_input("");
+        app.input_focus = InputFocus::Shell;
+        app.shell.text = "ls -la".to_string();
+        app.shell.cursor_position = 3;
+
+        let ev = KeyEvent {
+            code: KeyCode::Char('u'),
+            modifiers: KeyModifiers::CONTROL,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        };
+        app.handle_connected_input(ev).await.unwrap();
+        assert_eq!(app.shell.text, "-la");
+        assert_eq!(app.shell.cursor_position, 0);
+        assert_eq!(app.shell.kill_buffer, "ls ");
+    }
+
+    #[tokio::test]
+    async fn test_shell_ctrl_w_deletes_word() {
+        // Ctrl+W でカーソル直前の単語（word_left が返す範囲）が削除されることを確認する
+        use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+        let mut app = make_app_with_input("");
+        app.input_focus = InputFocus::Shell;
+        // "hello world" の末尾から Ctrl+W → ' ' を超えて "world" が削除対象
+        app.shell.text = "hello world".to_string();
+        app.shell.cursor_position = 11;
+
+        let ev = KeyEvent {
+            code: KeyCode::Char('w'),
+            modifiers: KeyModifiers::CONTROL,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        };
+        app.handle_connected_input(ev).await.unwrap();
+        assert_eq!(app.shell.text, "hello ");
+        assert_eq!(app.shell.cursor_position, 6);
+    }
+
+    #[tokio::test]
+    async fn test_shell_ctrl_a_selects_all() {
+        // Ctrl+A で selection_start=Some(0)・cursor=末尾の全選択状態になることを確認する
+        use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+        let mut app = make_app_with_input("");
+        app.input_focus = InputFocus::Shell;
+        app.shell.text = "ls -la".to_string();
+        app.shell.cursor_position = 0;
+
+        let ev = KeyEvent {
+            code: KeyCode::Char('a'),
+            modifiers: KeyModifiers::CONTROL,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        };
+        app.handle_connected_input(ev).await.unwrap();
+        assert_eq!(app.shell.selection_start, Some(0));
+        assert_eq!(app.shell.cursor_position, 6);
+    }
+
+    #[tokio::test]
+    async fn test_shell_ctrl_e_clears_selection() {
+        // Ctrl+E で選択が解除され、カーソルが行末に移動することを確認する
+        use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+        let mut app = make_app_with_input("");
+        app.input_focus = InputFocus::Shell;
+        app.shell.text = "ls -la".to_string();
+        app.shell.cursor_position = 0;
+        app.shell.selection_start = Some(3);
+
+        let ev = KeyEvent {
+            code: KeyCode::Char('e'),
+            modifiers: KeyModifiers::CONTROL,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        };
+        app.handle_connected_input(ev).await.unwrap();
+        assert_eq!(app.shell.selection_start, None);
+        assert_eq!(app.shell.cursor_position, 6);
+    }
+
+    #[tokio::test]
+    async fn test_shell_multibyte_selection() {
+        // マルチバイト文字を含む選択範囲の削除がバイト境界で正しく処理されることを確認する
+        use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+        let mut app = make_app_with_input("");
+        app.input_focus = InputFocus::Shell;
+        // "echo "(5char) + "テスト"(3char) = 8char
+        app.shell.text = "echo テスト".to_string();
+        app.shell.cursor_position = 8;
+        app.shell.selection_start = Some(5); // "テスト" を選択
+
+        let ev = KeyEvent {
+            code: KeyCode::Backspace,
+            modifiers: KeyModifiers::NONE,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        };
+        app.handle_connected_input(ev).await.unwrap();
+        assert_eq!(app.shell.text, "echo ");
+        assert_eq!(app.shell.cursor_position, 5);
+        assert_eq!(app.shell.selection_start, None);
+    }
+
     // is_completion_separator のテスト
 
     #[test]
@@ -1901,6 +2391,453 @@ mod tests {
         assert_eq!(app.word_right(0), 1);
         // (1) → 1,2,3,4,5 は区切り文字 → b(6) を進む → 7
         assert_eq!(app.word_right(1), 7);
+    }
+
+    // ============================================================
+    // prompt_word_left / prompt_word_right のユニットテスト
+    // ============================================================
+
+    #[test]
+    fn test_prompt_word_left_basic() {
+        // SQL の word_left と同じ文字列で同等の動作をすることを確認する
+        // "SELECT * FROM users"
+        //  chars: S(0)..T(5)' '(6)*(7)' '(8)F(9)..M(12)' '(13)u(14)..s(18)
+        let mut app = make_app_with_input("");
+        app.prompt.text = "SELECT * FROM users".to_string();
+
+        assert_eq!(app.prompt_word_left(19), 14); // 末尾(19) → "users" の先頭(14)
+        assert_eq!(app.prompt_word_left(14), 9);  // "users"先頭(14) → "FROM" の先頭(9)
+        assert_eq!(app.prompt_word_left(9), 0);   // "FROM"先頭(9) → "SELECT" の先頭(0)
+    }
+
+    #[test]
+    fn test_prompt_word_left_from_zero() {
+        // 位置 0 からの prompt_word_left は 0 を返すことを確認する
+        let mut app = make_app_with_input("");
+        app.prompt.text = "SELECT".to_string();
+        assert_eq!(app.prompt_word_left(0), 0);
+    }
+
+    #[test]
+    fn test_prompt_word_left_multibyte() {
+        // マルチバイト文字を含むテキストで char 単位の移動が正しいことを確認する
+        // "SELECT * FROM テーブル WHERE id = 1"
+        // "テーブル" は4文字(char単位)、先頭位置は14
+        let input = "SELECT * FROM テーブル WHERE id = 1";
+        let mut app = make_app_with_input("");
+        app.prompt.text = input.to_string();
+        let len = input.chars().count();
+
+        // 末尾(len) → "1" の先頭(len-1)
+        assert_eq!(app.prompt_word_left(len), len - 1);
+        // "テーブル" の末尾(18) → 先頭(14)
+        let table_end = 14 + 4; // 18
+        assert_eq!(app.prompt_word_left(table_end), 14);
+    }
+
+    #[test]
+    fn test_prompt_word_left_consecutive_separators() {
+        // 連続する区切り文字をまとめてスキップすることを確認する
+        let mut app = make_app_with_input("");
+        app.prompt.text = "a  =  b".to_string();
+        // 末尾(7) → 'b' をスキップ → '=' と空白をスキップ → 'a' の次(1)
+        assert_eq!(app.prompt_word_left(7), 6);
+        assert_eq!(app.prompt_word_left(6), 0);
+    }
+
+    #[test]
+    fn test_prompt_word_right_basic() {
+        // SQL の word_right と同じ文字列で同等の動作をすることを確認する
+        let mut app = make_app_with_input("");
+        app.prompt.text = "SELECT * FROM users".to_string();
+
+        assert_eq!(app.prompt_word_right(0), 6);  // 先頭(0) → "SELECT" の末尾(6)
+        assert_eq!(app.prompt_word_right(6), 13); // (6) → "FROM" の末尾(13)
+        assert_eq!(app.prompt_word_right(13), 19); // (13) → "users" の末尾(19)
+    }
+
+    #[test]
+    fn test_prompt_word_right_from_end() {
+        // 末尾からの prompt_word_right は末尾のまま返すことを確認する
+        let mut app = make_app_with_input("");
+        app.prompt.text = "SELECT".to_string();
+        let len = "SELECT".chars().count();
+        assert_eq!(app.prompt_word_right(len), len);
+    }
+
+    #[test]
+    fn test_prompt_word_right_multibyte() {
+        // マルチバイト文字を含むテキストで char 単位の移動が正しいことを確認する
+        // "SELECT テーブル WHERE": "SELECT "(7) + "テーブル"(4) + " WHERE"(6)
+        let input = "SELECT テーブル WHERE";
+        let mut app = make_app_with_input("");
+        app.prompt.text = input.to_string();
+
+        assert_eq!(app.prompt_word_right(0), 6);  // "SELECT" 末尾(6)
+        assert_eq!(app.prompt_word_right(6), 11); // "テーブル" 末尾(11): ' '(6)スキップ後テ(7)ー(8)ブ(9)ル(10)
+        assert_eq!(app.prompt_word_right(11), 17); // "WHERE" 末尾(17)
+    }
+
+    #[test]
+    fn test_prompt_word_right_consecutive_separators() {
+        // 連続する区切り文字をまとめてスキップすることを確認する
+        let mut app = make_app_with_input("");
+        app.prompt.text = "a  =  b".to_string();
+        assert_eq!(app.prompt_word_right(0), 1); // 先頭(0) → 'a'末尾(1)
+        assert_eq!(app.prompt_word_right(1), 7); // (1) → 区切り文字群スキップして 'b'末尾(7)
+    }
+
+    // ============================================================
+    // Prompt入力の選択・編集機能テスト
+    // ============================================================
+
+    #[tokio::test]
+    async fn test_prompt_shift_right_sets_selection() {
+        // 選択なし状態で Shift+Right を押すと現在位置が anchor になり右に伸びることを確認する
+        use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+        let mut app = make_app_with_input("");
+        app.input_focus = InputFocus::Prompt;
+        app.prompt.text = "hello world".to_string();
+        app.prompt.cursor_position = 3;
+
+        let ev = KeyEvent {
+            code: KeyCode::Right,
+            modifiers: KeyModifiers::SHIFT,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        };
+        app.handle_connected_input(ev).await.unwrap();
+        assert_eq!(app.prompt.selection_start, Some(3));
+        assert_eq!(app.prompt.cursor_position, 4);
+    }
+
+    #[tokio::test]
+    async fn test_prompt_shift_left_sets_selection() {
+        // 選択なし状態で Shift+Left を押すと現在位置が anchor になり左に伸びることを確認する
+        use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+        let mut app = make_app_with_input("");
+        app.input_focus = InputFocus::Prompt;
+        app.prompt.text = "hello world".to_string();
+        app.prompt.cursor_position = 5;
+
+        let ev = KeyEvent {
+            code: KeyCode::Left,
+            modifiers: KeyModifiers::SHIFT,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        };
+        app.handle_connected_input(ev).await.unwrap();
+        assert_eq!(app.prompt.selection_start, Some(5));
+        assert_eq!(app.prompt.cursor_position, 4);
+    }
+
+    #[tokio::test]
+    async fn test_prompt_shift_home_selects_to_beginning() {
+        // Shift+Home でカーソル位置を anchor として行頭まで選択されることを確認する
+        use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+        let mut app = make_app_with_input("");
+        app.input_focus = InputFocus::Prompt;
+        app.prompt.text = "hello world".to_string();
+        app.prompt.cursor_position = 5;
+
+        let ev = KeyEvent {
+            code: KeyCode::Home,
+            modifiers: KeyModifiers::SHIFT,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        };
+        app.handle_connected_input(ev).await.unwrap();
+        assert_eq!(app.prompt.selection_start, Some(5));
+        assert_eq!(app.prompt.cursor_position, 0);
+    }
+
+    #[tokio::test]
+    async fn test_prompt_shift_end_selects_to_end() {
+        // Shift+End でカーソル位置を anchor として行末まで選択されることを確認する
+        use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+        let mut app = make_app_with_input("");
+        app.input_focus = InputFocus::Prompt;
+        app.prompt.text = "hello world".to_string();
+        app.prompt.cursor_position = 3;
+
+        let ev = KeyEvent {
+            code: KeyCode::End,
+            modifiers: KeyModifiers::SHIFT,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        };
+        app.handle_connected_input(ev).await.unwrap();
+        assert_eq!(app.prompt.selection_start, Some(3));
+        assert_eq!(app.prompt.cursor_position, 11);
+    }
+
+    #[tokio::test]
+    async fn test_prompt_left_clears_selection() {
+        // 選択中に通常の Left を押すと選択が解除されることを確認する
+        use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+        let mut app = make_app_with_input("");
+        app.input_focus = InputFocus::Prompt;
+        app.prompt.text = "hello world".to_string();
+        app.prompt.cursor_position = 5;
+        app.prompt.selection_start = Some(2);
+
+        let ev = KeyEvent {
+            code: KeyCode::Left,
+            modifiers: KeyModifiers::NONE,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        };
+        app.handle_connected_input(ev).await.unwrap();
+        assert_eq!(app.prompt.selection_start, None);
+        assert_eq!(app.prompt.cursor_position, 4);
+    }
+
+    #[tokio::test]
+    async fn test_prompt_right_clears_selection() {
+        // 選択中に通常の Right を押すと選択が解除されることを確認する
+        use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+        let mut app = make_app_with_input("");
+        app.input_focus = InputFocus::Prompt;
+        app.prompt.text = "hello world".to_string();
+        app.prompt.cursor_position = 3;
+        app.prompt.selection_start = Some(8);
+
+        let ev = KeyEvent {
+            code: KeyCode::Right,
+            modifiers: KeyModifiers::NONE,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        };
+        app.handle_connected_input(ev).await.unwrap();
+        assert_eq!(app.prompt.selection_start, None);
+        assert_eq!(app.prompt.cursor_position, 4);
+    }
+
+    #[tokio::test]
+    async fn test_prompt_char_replaces_selection() {
+        // 選択範囲がある状態で文字を入力すると選択範囲が置換されることを確認する
+        use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+        let mut app = make_app_with_input("");
+        app.input_focus = InputFocus::Prompt;
+        app.prompt.text = "hello world".to_string();
+        app.prompt.cursor_position = 5;
+        app.prompt.selection_start = Some(0); // "hello" を選択
+
+        let ev = KeyEvent {
+            code: KeyCode::Char('Y'),
+            modifiers: KeyModifiers::NONE,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        };
+        app.handle_connected_input(ev).await.unwrap();
+        assert_eq!(app.prompt.text, "Y world");
+        assert_eq!(app.prompt.cursor_position, 1);
+        assert_eq!(app.prompt.selection_start, None);
+    }
+
+    #[tokio::test]
+    async fn test_prompt_backspace_deletes_selection() {
+        // 選択範囲がある状態で Backspace を押すと選択範囲全体が削除されることを確認する
+        use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+        let mut app = make_app_with_input("");
+        app.input_focus = InputFocus::Prompt;
+        app.prompt.text = "hello world".to_string();
+        app.prompt.cursor_position = 5;
+        app.prompt.selection_start = Some(0); // "hello" を選択
+
+        let ev = KeyEvent {
+            code: KeyCode::Backspace,
+            modifiers: KeyModifiers::NONE,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        };
+        app.handle_connected_input(ev).await.unwrap();
+        assert_eq!(app.prompt.text, " world");
+        assert_eq!(app.prompt.cursor_position, 0);
+        assert_eq!(app.prompt.selection_start, None);
+    }
+
+    #[tokio::test]
+    async fn test_prompt_delete_deletes_selection() {
+        // 選択範囲がある状態で Delete を押すと選択範囲全体が削除されることを確認する
+        use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+        let mut app = make_app_with_input("");
+        app.input_focus = InputFocus::Prompt;
+        // cursor(11)が末尾, selection_start(6)が'w'の手前 → "world" を選択
+        app.prompt.text = "hello world".to_string();
+        app.prompt.cursor_position = 11;
+        app.prompt.selection_start = Some(6);
+
+        let ev = KeyEvent {
+            code: KeyCode::Delete,
+            modifiers: KeyModifiers::NONE,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        };
+        app.handle_connected_input(ev).await.unwrap();
+        assert_eq!(app.prompt.text, "hello ");
+        assert_eq!(app.prompt.cursor_position, 6);
+        assert_eq!(app.prompt.selection_start, None);
+    }
+
+    #[tokio::test]
+    async fn test_prompt_ctrl_k_kill_and_yank() {
+        // Ctrl+K でカーソル以降が kill_buffer に保存され、Ctrl+Y で元の位置に挿入されることを確認する
+        use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+        let mut app = make_app_with_input("");
+        app.input_focus = InputFocus::Prompt;
+        app.prompt.text = "hello world".to_string();
+        app.prompt.cursor_position = 6;
+
+        let ev_k = KeyEvent {
+            code: KeyCode::Char('k'),
+            modifiers: KeyModifiers::CONTROL,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        };
+        app.handle_connected_input(ev_k).await.unwrap();
+        assert_eq!(app.prompt.text, "hello ");
+        assert_eq!(app.prompt.cursor_position, 6);
+        assert_eq!(app.prompt.kill_buffer, "world");
+
+        // Ctrl+Y で kill_buffer の内容をペーストする
+        let ev_y = KeyEvent {
+            code: KeyCode::Char('y'),
+            modifiers: KeyModifiers::CONTROL,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        };
+        app.handle_connected_input(ev_y).await.unwrap();
+        assert_eq!(app.prompt.text, "hello world");
+        assert_eq!(app.prompt.cursor_position, 11);
+    }
+
+    #[tokio::test]
+    async fn test_prompt_ctrl_u_kills_before_cursor() {
+        // Ctrl+U でカーソル以前のテキストが kill_buffer に保存されることを確認する
+        use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+        let mut app = make_app_with_input("");
+        app.input_focus = InputFocus::Prompt;
+        app.prompt.text = "hello world".to_string();
+        app.prompt.cursor_position = 6;
+
+        let ev = KeyEvent {
+            code: KeyCode::Char('u'),
+            modifiers: KeyModifiers::CONTROL,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        };
+        app.handle_connected_input(ev).await.unwrap();
+        assert_eq!(app.prompt.text, "world");
+        assert_eq!(app.prompt.cursor_position, 0);
+        assert_eq!(app.prompt.kill_buffer, "hello ");
+    }
+
+    #[tokio::test]
+    async fn test_prompt_ctrl_w_deletes_word() {
+        // Ctrl+W でカーソル直前の単語（word_left が返す範囲）が削除されることを確認する
+        use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+        let mut app = make_app_with_input("");
+        app.input_focus = InputFocus::Prompt;
+        // "hello world" の末尾から Ctrl+W → "world" が削除対象
+        app.prompt.text = "hello world".to_string();
+        app.prompt.cursor_position = 11;
+
+        let ev = KeyEvent {
+            code: KeyCode::Char('w'),
+            modifiers: KeyModifiers::CONTROL,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        };
+        app.handle_connected_input(ev).await.unwrap();
+        assert_eq!(app.prompt.text, "hello ");
+        assert_eq!(app.prompt.cursor_position, 6);
+    }
+
+    #[tokio::test]
+    async fn test_prompt_ctrl_a_selects_all() {
+        // Ctrl+A で selection_start=Some(0)・cursor=末尾の全選択状態になることを確認する
+        use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+        let mut app = make_app_with_input("");
+        app.input_focus = InputFocus::Prompt;
+        app.prompt.text = "hello world".to_string();
+        app.prompt.cursor_position = 0;
+
+        let ev = KeyEvent {
+            code: KeyCode::Char('a'),
+            modifiers: KeyModifiers::CONTROL,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        };
+        app.handle_connected_input(ev).await.unwrap();
+        assert_eq!(app.prompt.selection_start, Some(0));
+        assert_eq!(app.prompt.cursor_position, 11);
+    }
+
+    #[tokio::test]
+    async fn test_prompt_ctrl_e_clears_selection() {
+        // Ctrl+E で選択が解除され、カーソルが行末に移動することを確認する
+        use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+        let mut app = make_app_with_input("");
+        app.input_focus = InputFocus::Prompt;
+        app.prompt.text = "hello world".to_string();
+        app.prompt.cursor_position = 0;
+        app.prompt.selection_start = Some(5);
+
+        let ev = KeyEvent {
+            code: KeyCode::Char('e'),
+            modifiers: KeyModifiers::CONTROL,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        };
+        app.handle_connected_input(ev).await.unwrap();
+        assert_eq!(app.prompt.selection_start, None);
+        assert_eq!(app.prompt.cursor_position, 11);
+    }
+
+    #[tokio::test]
+    async fn test_prompt_multibyte_selection() {
+        // マルチバイト文字を含む選択範囲の削除がバイト境界で正しく処理されることを確認する
+        use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+        let mut app = make_app_with_input("");
+        app.input_focus = InputFocus::Prompt;
+        // "SQL: "(5char) + "テーブル名を教えて"(9char) = 14char
+        app.prompt.text = "SQL: テーブル名を教えて".to_string();
+        app.prompt.cursor_position = 14;
+        app.prompt.selection_start = Some(5); // "テーブル名を教えて" を選択
+
+        let ev = KeyEvent {
+            code: KeyCode::Backspace,
+            modifiers: KeyModifiers::NONE,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        };
+        app.handle_connected_input(ev).await.unwrap();
+        assert_eq!(app.prompt.text, "SQL: ");
+        assert_eq!(app.prompt.cursor_position, 5);
+        assert_eq!(app.prompt.selection_start, None);
+    }
+
+    #[tokio::test]
+    async fn test_prompt_editing_ignored_while_processing() {
+        // is_processing が true の間は編集系キー入力が無視されることを確認する
+        use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+        let mut app = make_app_with_input("");
+        app.input_focus = InputFocus::Prompt;
+        app.prompt.text = "hello".to_string();
+        app.prompt.cursor_position = 5;
+        app.prompt.is_processing = true; // 処理中フラグを立てる
+
+        let ev = KeyEvent {
+            code: KeyCode::Char('X'),
+            modifiers: KeyModifiers::NONE,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        };
+        app.handle_connected_input(ev).await.unwrap();
+        // 処理中のため文字が挿入されていないことを確認する
+        assert_eq!(app.prompt.text, "hello");
+        assert_eq!(app.prompt.cursor_position, 5);
     }
 
     // ============================================================

@@ -1,3 +1,4 @@
+pub mod claude;
 pub mod completion;
 pub mod config;
 pub mod connection;

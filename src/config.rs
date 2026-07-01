@@ -11,6 +11,16 @@ use crate::t;
 pub struct AppSettings {
     /// 表示言語（"en" / "ja"）。未指定時はデフォルト（"en"）
     pub language: Option<String>,
+
+    /// Anthropic API キー（Claude API 使用時に必要）
+    /// 未指定時は環境変数 ANTHROPIC_API_KEY から取得する
+    #[serde(default)]
+    pub anthropic_api_key: Option<Password>,
+
+    /// 使用する Claude モデルID（未指定時は claude-3-5-haiku-20241022 を使用）
+    /// 未指定時は環境変数 CLAUDE_MODEL から取得する
+    #[serde(default)]
+    pub claude_model: Option<String>,
 }
 
 /// アプリケーション設定
@@ -246,6 +256,22 @@ impl Config {
 
         // バリデーション
         config.validate()?;
+
+        // 環境変数フォールバック:
+        // anthropic_api_key が未設定なら ANTHROPIC_API_KEY 環境変数から取得する
+        // APIキーはログに出力しないようにする（セキュリティ要件）
+        let mut config = config;
+        if config.settings.anthropic_api_key.is_none() {
+            if let Ok(key) = std::env::var("ANTHROPIC_API_KEY") {
+                config.settings.anthropic_api_key = Some(Password(key));
+            }
+        }
+        // claude_model が未設定なら CLAUDE_MODEL 環境変数から取得する
+        if config.settings.claude_model.is_none() {
+            if let Ok(model) = std::env::var("CLAUDE_MODEL") {
+                config.settings.claude_model = Some(model);
+            }
+        }
 
         Ok(config)
     }

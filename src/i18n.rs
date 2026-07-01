@@ -187,6 +187,7 @@ pub enum ErrorMsg<'a> {
     QueryTimeout,
     Tui { detail: &'a str },
     Io { detail: &'a str },
+    ClaudeApi { detail: &'a str },
     Other { detail: &'a str },
 }
 
@@ -213,6 +214,7 @@ impl<'a> ErrorMsg<'a> {
             ErrorMsg::QueryTimeout => "Query execution timed out".to_string(),
             ErrorMsg::Tui { detail } => format!("TUI error: {}", detail),
             ErrorMsg::Io { detail } => format!("I/O error: {}", detail),
+            ErrorMsg::ClaudeApi { detail } => format!("Claude API error: {}", detail),
             ErrorMsg::Other { detail } => detail.to_string(),
         }
     }
@@ -238,6 +240,7 @@ impl<'a> ErrorMsg<'a> {
             ErrorMsg::QueryTimeout => "クエリの実行がタイムアウトしました".to_string(),
             ErrorMsg::Tui { detail } => format!("TUIエラー: {}", detail),
             ErrorMsg::Io { detail } => format!("I/Oエラー: {}", detail),
+            ErrorMsg::ClaudeApi { detail } => format!("Claude API エラー: {}", detail),
             ErrorMsg::Other { detail } => detail.to_string(),
         }
     }
@@ -294,6 +297,13 @@ pub enum TuiMsg<'a> {
     NoColumnsFound { table: &'a str },
     // Shell入力エリア
     ShellInputTitleFocused,
+    // PROMPT入力エリア（Claude AI連携）
+    PromptInputTitle,
+    PromptInputTitleFocused,
+    PromptProcessing,
+    /// スピナーと組み合わせて使うベースメッセージ（スピナー文字は render 側で付与）
+    PromptProcessingBase,
+    PromptApiKeyNotSet,
     // 動的メッセージ（引数付き）
     QueryFailed { detail: &'a str },
     QueryCancelled { query: &'a str },
@@ -363,6 +373,13 @@ impl<'a> TuiMsg<'a> {
             TuiMsg::ShellInputTitleFocused => {
                 "Shell Input (Enter: run, Ctrl+J: newline)".to_string()
             }
+            TuiMsg::PromptInputTitle => "AI Prompt".to_string(),
+            TuiMsg::PromptInputTitleFocused => "AI Prompt (focused)".to_string(),
+            TuiMsg::PromptProcessing => "Generating SQL...".to_string(),
+            TuiMsg::PromptProcessingBase => "Generating SQL".to_string(),
+            TuiMsg::PromptApiKeyNotSet => {
+                "Set ANTHROPIC_API_KEY to use AI prompt".to_string()
+            }
         }
     }
 
@@ -422,6 +439,13 @@ impl<'a> TuiMsg<'a> {
             }
             TuiMsg::ShellInputTitleFocused => {
                 "SHELL入力 (Enter: 実行, Ctrl+J: 改行)".to_string()
+            }
+            TuiMsg::PromptInputTitle => "AIプロンプト".to_string(),
+            TuiMsg::PromptInputTitleFocused => "AIプロンプト (入力中)".to_string(),
+            TuiMsg::PromptProcessing => "SQL生成中...".to_string(),
+            TuiMsg::PromptProcessingBase => "SQL生成中".to_string(),
+            TuiMsg::PromptApiKeyNotSet => {
+                "ANTHROPIC_API_KEY を設定するとAIプロンプトが使えます".to_string()
             }
         }
     }
