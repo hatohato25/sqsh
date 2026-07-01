@@ -1570,8 +1570,7 @@ impl App {
             }
             Err(join_error) => {
                 tracing::error!("PROMPT task panicked: {}", join_error);
-                self.prompt.last_error =
-                    Some(format!("タスクが異常終了しました: {}", join_error));
+                self.prompt.last_error = Some(format!("タスクが異常終了しました: {}", join_error));
                 self.prompt.is_processing = false;
                 // アニメーションを停止するためカウンターをリセットする
                 self.prompt.loading_tick = 0;
@@ -2406,8 +2405,8 @@ mod tests {
         app.prompt.text = "SELECT * FROM users".to_string();
 
         assert_eq!(app.prompt_word_left(19), 14); // 末尾(19) → "users" の先頭(14)
-        assert_eq!(app.prompt_word_left(14), 9);  // "users"先頭(14) → "FROM" の先頭(9)
-        assert_eq!(app.prompt_word_left(9), 0);   // "FROM"先頭(9) → "SELECT" の先頭(0)
+        assert_eq!(app.prompt_word_left(14), 9); // "users"先頭(14) → "FROM" の先頭(9)
+        assert_eq!(app.prompt_word_left(9), 0); // "FROM"先頭(9) → "SELECT" の先頭(0)
     }
 
     #[test]
@@ -2451,7 +2450,7 @@ mod tests {
         let mut app = make_app_with_input("");
         app.prompt.text = "SELECT * FROM users".to_string();
 
-        assert_eq!(app.prompt_word_right(0), 6);  // 先頭(0) → "SELECT" の末尾(6)
+        assert_eq!(app.prompt_word_right(0), 6); // 先頭(0) → "SELECT" の末尾(6)
         assert_eq!(app.prompt_word_right(6), 13); // (6) → "FROM" の末尾(13)
         assert_eq!(app.prompt_word_right(13), 19); // (13) → "users" の末尾(19)
     }
@@ -2473,7 +2472,7 @@ mod tests {
         let mut app = make_app_with_input("");
         app.prompt.text = input.to_string();
 
-        assert_eq!(app.prompt_word_right(0), 6);  // "SELECT" 末尾(6)
+        assert_eq!(app.prompt_word_right(0), 6); // "SELECT" 末尾(6)
         assert_eq!(app.prompt_word_right(6), 11); // "テーブル" 末尾(11): ' '(6)スキップ後テ(7)ー(8)ブ(9)ル(10)
         assert_eq!(app.prompt_word_right(11), 17); // "WHERE" 末尾(17)
     }

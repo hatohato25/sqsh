@@ -293,8 +293,12 @@ pub enum TuiMsg<'a> {
     // selector.rs 関連
     SelectConnectionPrompt,
     // カラム選択関連
-    ColumnSelectPrompt { table: &'a str },
-    NoColumnsFound { table: &'a str },
+    ColumnSelectPrompt {
+        table: &'a str,
+    },
+    NoColumnsFound {
+        table: &'a str,
+    },
     // Shell入力エリア
     ShellInputTitleFocused,
     // PROMPT入力エリア（Claude AI連携）
@@ -305,9 +309,15 @@ pub enum TuiMsg<'a> {
     PromptProcessingBase,
     PromptApiKeyNotSet,
     // 動的メッセージ（引数付き）
-    QueryFailed { detail: &'a str },
-    QueryCancelled { query: &'a str },
-    QueryTaskFailed { detail: &'a str },
+    QueryFailed {
+        detail: &'a str,
+    },
+    QueryCancelled {
+        query: &'a str,
+    },
+    QueryTaskFailed {
+        detail: &'a str,
+    },
     ReadonlyBlocked,
 }
 

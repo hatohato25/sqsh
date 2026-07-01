@@ -578,8 +578,9 @@ pub(super) fn build_multiline_text<'a>(
                     let sel_chars = overlap_end - overlap_start;
 
                     let before: String = row_chars[..before_chars].iter().collect();
-                    let selected: String =
-                        row_chars[before_chars..before_chars + sel_chars].iter().collect();
+                    let selected: String = row_chars[before_chars..before_chars + sel_chars]
+                        .iter()
+                        .collect();
                     let after: String = row_chars[before_chars + sel_chars..].iter().collect();
 
                     Line::from(vec![
@@ -793,11 +794,11 @@ pub(super) fn render_prompt_area(
             prompt_inner_width,
         );
         Paragraph::new(text).block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(ratatui::text::Span::styled(title, title_style))
-                    .border_style(border_style),
-            )
+            Block::default()
+                .borders(Borders::ALL)
+                .title(ratatui::text::Span::styled(title, title_style))
+                .border_style(border_style),
+        )
     };
 
     frame.render_widget(paragraph, area);
@@ -832,7 +833,10 @@ mod tests {
     #[test]
     fn test_wrap_logical_line_basic() {
         // inner_width=5 で 12 文字をハード折り返しすると 3 物理行になる
-        assert_eq!(wrap_logical_line("abcdefghijkl", 5), vec![(0, 5), (5, 10), (10, 12)]);
+        assert_eq!(
+            wrap_logical_line("abcdefghijkl", 5),
+            vec![(0, 5), (5, 10), (10, 12)]
+        );
     }
 
     #[test]
